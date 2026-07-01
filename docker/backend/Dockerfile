@@ -4,7 +4,7 @@ ARG BASE_VERSION=1.0.2
 ARG BASE_IMAGE=stirlingtools/stirling-pdf-base:${BASE_VERSION}
 
 # Stage 1: Build the Java application (backend only, no frontend)
-FROM gradle:9.6.0-jdk25@sha256:e3905233ae349e72016daf8a0e19f085a1dd89ded8ec88b3d8335d3fd0b350f4 AS app-build
+FROM gradle:9.6.1-jdk25@sha256:500565499832ecdf3d6e8f0b2b81a3a1feeae6024e86c33705e85bd6686a456f AS app-build
 
 # JDK 25+: --add-exports is no longer accepted via JAVA_TOOL_OPTIONS; use JDK_JAVA_OPTIONS instead
 ENV JDK_JAVA_OPTIONS="--add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED \
