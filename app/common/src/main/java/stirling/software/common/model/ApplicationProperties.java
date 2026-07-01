@@ -1,0 +1,1597 @@
+package stirling.software.common.model;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.core.env.ConfigurableEnvironment;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.EncodedResource;
+import org.springframework.stereotype.Component;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import jakarta.annotation.PostConstruct;
+
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.ToString;
+import lombok.extern.slf4j.Slf4j;
+
+import stirling.software.common.configuration.InstallationPathConfig;
+import stirling.software.common.configuration.YamlPropertySourceFactory;
+import stirling.software.common.constants.JwtConstants;
+import stirling.software.common.model.exception.UnsupportedProviderException;
+import stirling.software.common.model.oauth2.GitHubProvider;
+import stirling.software.common.model.oauth2.GoogleProvider;
+import stirling.software.common.model.oauth2.KeycloakProvider;
+import stirling.software.common.model.oauth2.Provider;
+import stirling.software.common.service.SsrfProtectionService.SsrfProtectionLevel;
+import stirling.software.common.util.ValidationUtils;
+
+@Data
+@Slf4j
+@Component
+@Order(Ordered.HIGHEST_PRECEDENCE)
+@ConfigurationProperties(prefix = "")
+public class ApplicationProperties {
+
+    private Legal legal = new Legal();
+    private Security security = new Security();
+    private System system = new System();
+    private Storage storage = new Storage();
+    private Ui ui = new Ui();
+    private Endpoints endpoints = new Endpoints();
+    private Metrics metrics = new Metrics();
+    private AutomaticallyGenerated automaticallyGenerated = new AutomaticallyGenerated();
+
+    private Mail mail = new Mail();
+    private Telegram telegram = new Telegram();
+
+    private Premium premium = new Premium();
+
+    @JsonIgnore // Deprecated - completely hidden from JSON serialization
+    private EnterpriseEdition enterpriseEdition = new EnterpriseEdition();
+
+    private AutoPipeline autoPipeline = new AutoPipeline();
+    private ProcessExecutor processExecutor = new ProcessExecutor();
+    private PdfEditor pdfEditor = new PdfEditor();
+    private AiEngine aiEngine = new AiEngine();
+    private Mcp mcp = new Mcp();
+    private InternalApi internalApi = new InternalApi();
+    private Cluster cluster = new Cluster();
+    private Policies policies = new Policies();
+
+    @Bean
+    public PropertySource<?> dynamicYamlPropertySource(ConfigurableEnvironment environment)
+            throws IOException {
+        String configPath = InstallationPathConfig.getSettingsPath();
+        log.debug("Attempting to load settings from: {}", configPath);
+
+        File file = new File(configPath);
+        if (!file.exists()) {
+            log.error("Warning: Settings file does not exist at: {}", configPath);
+        }
+
+        Resource resource = new FileSystemResource(configPath);
+        if (!resource.exists()) {
+            throw new FileNotFoundException("Settings file not found at: " + configPath);
+        }
+
+        EncodedResource encodedResource = new EncodedResource(resource);
+        PropertySource<?> propertySource =
+                new YamlPropertySourceFactory().createPropertySource(null, encodedResource);
+
+        boolean saasActive = Arrays.asList(environment.getActiveProfiles()).contains("saas");
+        if (saasActive) {
+            // Saas-pinned values in application-saas.properties must beat settings.yml.
+            environment.getPropertySources().addLast(propertySource);
+        } else {
+            environment.getPropertySources().addFirst(propertySource);
+        }
+
+        log.debug("Loaded properties: {}", propertySource.getSource());
+
+        return propertySource;
+    }
+
+    /**
+     * Initialize fileUploadLimit from environment variables if not set in settings.yml. Supports
+     * SYSTEMFILEUPLOADLIMIT (format: "100MB") and SYSTEM_MAXFILESIZE (format: "100" in MB).
+     */
+    @PostConstruct
+    public void initializeFileUploadLimitFromEnv() {
+        // Only override if fileUploadLimit is not already set in settings.yml
+        if (system.getFileUploadLimit() == null || system.getFileUploadLimit().isEmpty()) {
+            String fileUploadLimit = null;
+
+            // Check SYSTEMFILEUPLOADLIMIT first (format: "100MB", "1GB", etc.)
+            String systemFileUploadLimit = java.lang.System.getenv("SYSTEMFILEUPLOADLIMIT");
+            if (systemFileUploadLimit != null && !systemFileUploadLimit.trim().isEmpty()) {
+                fileUploadLimit = systemFileUploadLimit.trim();
+                log.info("Setting fileUploadLimit from SYSTEMFILEUPLOADLIMIT: {}", fileUploadLimit);
+            } else {
+                // Check SYSTEM_MAXFILESIZE (format: number in MB, e.g., "100")
+                String systemMaxFileSize = java.lang.System.getenv("SYSTEM_MAXFILESIZE");
+                if (systemMaxFileSize != null && !systemMaxFileSize.trim().isEmpty()) {
+                    try {
+                        // Validate it's a number
+                        long sizeInMB = Long.parseLong(systemMaxFileSize.trim());
+                        if (sizeInMB > 0 && sizeInMB <= 999) {
+                            fileUploadLimit = sizeInMB + "MB";
+                            log.info(
+                                    "Setting fileUploadLimit from SYSTEM_MAXFILESIZE: {}MB",
+                                    sizeInMB);
+                        } else {
+                            log.warn(
+                                    "SYSTEM_MAXFILESIZE value {} is out of valid range (1-999), ignoring",
+                                    sizeInMB);
+                        }
+                    } catch (NumberFormatException e) {
+                        log.warn(
+                                "SYSTEM_MAXFILESIZE value '{}' is not a valid number, ignoring",
+                                systemMaxFileSize);
+                    }
+                }
+            }
+
+            if (fileUploadLimit != null) {
+                system.setFileUploadLimit(fileUploadLimit);
+            }
+        }
+    }
+
+    @Data
+    public static class AutoPipeline {
+        private String outputFolder;
+        private FileReadiness fileReadiness = new FileReadiness();
+
+        /**
+         * Configuration for the {@link stirling.software.common.util.FileReadinessChecker}.
+         * Controls how the pipeline determines whether a file is fully written and stable before
+         * processing begins.
+         */
+        @Data
+        public static class FileReadiness {
+            /**
+             * Master toggle. When {@code false} every readiness check is skipped and all files are
+             * considered immediately ready (preserves legacy behaviour).
+             */
+            private boolean enabled = true;
+
+            /**
+             * How long (in milliseconds) a file must remain unmodified before it is considered
+             * stable. Files modified more recently than this threshold are skipped and retried on
+             * the next scan cycle. Default: 5 000 ms (5 seconds).
+             */
+            private long settleTimeMillis = 5000;
+
+            /**
+             * How long (in milliseconds) to pause between two consecutive file-size reads when
+             * checking whether a file is still being written. If the size differs between the two
+             * reads the file is considered unstable. This catches active copies on Linux/macOS
+             * where advisory locking alone cannot detect a mid-copy file. Default: 500 ms.
+             */
+            private long sizeCheckDelayMillis = 500;
+
+            /**
+             * Optional list of file extensions (without the leading dot, case-insensitive) that are
+             * allowed through the readiness check. An empty list means all extensions are accepted.
+             * Example: {@code ["pdf", "tiff"]} will skip any file whose extension is not {@code
+             * pdf} or {@code tiff}.
+             */
+            private List<String> allowedExtensions = new java.util.ArrayList<>();
+        }
+    }
+
+    @Data
+    public static class Policies {
+        /**
+         * Master switch for the policy + sources subsystem (the PAYG-metered automation surface).
+         */
+        private boolean enabled = false;
+
+        /**
+         * Absolute directories that policy folder input sources and output sinks may read from or
+         * write to. Empty (the default) disables folder access entirely, so a policy can never be
+         * pointed at an arbitrary server path. Stirling's own config directory is always
+         * off-limits, and folder access is always disabled in SaaS mode regardless of this list.
+         */
+        private List<String> allowedFolderRoots = new java.util.ArrayList<>();
+
+        /** How often (seconds) the schedule trigger checks for policies whose schedule is due. */
+        private long scheduleSweepSeconds = 60;
+
+        /**
+         * How often (seconds) the folder-watch trigger reconciles its watch registrations and
+         * re-runs every folder-watch policy as a safety net for filesystem events that were missed
+         * (NFS, bind mounts, inotify-queue overflow).
+         */
+        private long watchReconcileSeconds = 300;
+
+        /**
+         * How long (milliseconds) the folder-watch trigger keeps draining filesystem events after
+         * the first, so a burst from a single file copy coalesces into one run instead of many.
+         */
+        private long watchQuietPeriodMs = 500;
+
+        /**
+         * SSE emitter timeout (milliseconds) for streamed runs; generous for long multi-step runs.
+         */
+        private long streamTimeoutMs = 1800000;
+
+        /**
+         * How long (minutes) a finished run's in-memory state is retained before eviction,
+         * mirroring the job-result expiry so rich run state does not outlive the process. Active
+         * and paused runs are kept regardless of age.
+         */
+        private int runExpiryMinutes = 30;
+    }
+
+    @Data
+    public static class PdfEditor {
+        private Cache cache = new Cache();
+        private FontNormalization fontNormalization = new FontNormalization();
+        private CffConverter cffConverter = new CffConverter();
+        private Type3 type3 = new Type3();
+        private String fallbackFont = "classpath:/static/fonts/NotoSans-Regular.ttf";
+
+        @Data
+        public static class Cache {
+            private long maxBytes = -1;
+            private int maxPercent = 20;
+        }
+
+        @Data
+        public static class FontNormalization {
+            private boolean enabled = false;
+        }
+
+        @Data
+        public static class CffConverter {
+            private boolean enabled = true;
+            private String method = "python";
+            private String pythonCommand = "/opt/venv/bin/python3";
+            private String pythonScript = "/scripts/convert_cff_to_ttf.py";
+            private String fontforgeCommand = "fontforge";
+        }
+
+        @Data
+        public static class Type3 {
+            private Library library = new Library();
+
+            @Data
+            public static class Library {
+                private boolean enabled = true;
+                private String index = "classpath:/type3/library/index.json";
+            }
+        }
+    }
+
+    @Data
+    public static class AiEngine {
+        private boolean enabled = false;
+        private String url = "http://localhost:5001";
+        private int timeoutSeconds = 120;
+
+        /**
+         * Longer timeout for heavy operations like RAG ingestion, which embeds the whole document
+         * and can take multiple minutes for large books. Applied per-call when the caller
+         * explicitly requests it via {@code AiEngineClient.postWithTimeout}.
+         */
+        private int longRunningTimeoutSeconds = 600;
+    }
+
+    /**
+     * Model Context Protocol (MCP) server configuration. All keys live under the top-level {@code
+     * mcp.*} prefix. {@link #enabled} defaults to {@code false}: when off, no MCP beans are wired,
+     * no /mcp endpoint exists, and no protected-resource metadata is published.
+     */
+    @Data
+    public static class Mcp {
+
+        /** Master switch. When {@code false} (default), no MCP beans are wired. */
+        private boolean enabled = false;
+
+        /**
+         * When {@code true} (default), invocations require an OAuth scope: {@code mcp.tools.read}
+         * for read-style operations and {@code mcp.tools.write} for write/destructive ones. When
+         * {@code false}, scope checks are skipped (use only if your IdP issues a single coarse
+         * scope).
+         */
+        private boolean scopesEnabled = true;
+
+        /** How often to refresh the AI capabilities manifest from the engine. */
+        private int engineCapabilityRefreshMinutes = 5;
+
+        /**
+         * Tool allow-list (operation ids, e.g. {@code compress-pdf}). When non-empty, ONLY these
+         * operations are exposed over MCP; everything else is hidden, undescribable, and
+         * uninvocable - on top of the global endpoint enable/disable config. Empty = allow all.
+         */
+        private List<String> allowedOperations = new ArrayList<>();
+
+        /**
+         * Tool deny-list (operation ids). Any operation listed here is removed from MCP even if it
+         * would otherwise be allowed. Applied after {@link #allowedOperations}.
+         */
+        private List<String> blockedOperations = new ArrayList<>();
+
+        /** Max MCP request body size in bytes; inline file uploads ride in the JSON-RPC body. */
+        private long maxRequestBytes = 10L * 1024 * 1024;
+
+        /** Results up to this size return inline as base64; larger ones return a fileId only. */
+        private long maxInlineResponseBytes = 10L * 1024 * 1024;
+
+        private Auth auth = new Auth();
+
+        @Data
+        public static class Auth {
+            /**
+             * Authentication mode for the MCP endpoint. {@code oauth} (default) runs a full OAuth2
+             * resource server (JWT, RFC 8707 audience, RFC 9728 metadata). {@code apikey} accepts a
+             * Stirling per-user API key via the {@code X-API-KEY} header (or {@code Authorization:
+             * Bearer <key>}) and binds the request to that user - the low-friction self-host path,
+             * no external IdP required.
+             */
+            private String mode = "oauth";
+
+            /** OAuth2 issuer URI, e.g. {@code http://localhost:9000}. Required when MCP is on. */
+            private String issuerUri = "";
+
+            /**
+             * JWKS URI. When blank, derived from the issuer's {@code
+             * /.well-known/openid-configuration} document.
+             */
+            private String jwksUri = "";
+
+            /**
+             * RFC 8707 resource identifier of THIS MCP server, e.g. {@code
+             * http://localhost:8080/mcp}. Tokens that do not list this id in their {@code aud}
+             * claim are rejected with HTTP 401.
+             */
+            private String resourceId = "";
+
+            /**
+             * Additional JWT audiences accepted at the MCP endpoint, on top of {@link #resourceId}.
+             * Empty (default) keeps strict RFC 8707 binding. Some IdPs cannot mint
+             * resource-specific audiences - e.g. Supabase's OAuth server always issues {@code
+             * aud=authenticated} - so operators list the audience their IdP actually emits here
+             * (env: {@code MCP_AUTH_ACCEPTEDAUDIENCES}, comma-separated).
+             */
+            private List<String> acceptedAudiences = new ArrayList<>();
+
+            /**
+             * JWT claim whose value is matched against a provisioned Stirling username. Defaults to
+             * {@code sub}; set to {@code email} or {@code preferred_username} to match how your IdP
+             * maps users to Stirling accounts.
+             */
+            private String usernameClaim = "sub";
+
+            /**
+             * When {@code true} (default), a validated token is accepted only if its {@link
+             * #usernameClaim} value resolves to an existing, enabled Stirling user account. Tokens
+             * whose subject has no Stirling account (or a disabled one) are rejected with HTTP 403.
+             * Set to {@code false} only if you intentionally want any IdP-valid token to use MCP
+             * without a local account.
+             */
+            private boolean requireExistingAccount = true;
+        }
+    }
+
+    /**
+     * Cluster backplane configuration. All keys live under the top-level {@code cluster.*} prefix
+     * (e.g. env var {@code CLUSTER_ENABLED}). The master switch is {@link #enabled} and defaults to
+     * off; when off the in-process backplane is wired and no other cluster keys are required.
+     */
+    @Data
+    public static class Cluster {
+
+        /** Master switch. When {@code false} (default) the in-process backplane is wired. */
+        private boolean enabled = false;
+
+        /** Backplane implementation selector. Valid values: {@code inprocess} | {@code valkey}. */
+        private String backplane = "inprocess";
+
+        /**
+         * Transient cluster job-artifact store selector. Valid values: {@code local} | {@code s3}.
+         *
+         * <p>This is distinct from {@code storage.provider}, which selects the backend for
+         * persistent user-uploaded files. The two switches exist because the user-facing storage
+         * feature is optional ({@code storage.enabled=false} is common) but every multi-node
+         * cluster still needs a shared artifact store to serve cross-node downloads. Both
+         * implementations share credentials from {@code storage.s3.*} when set to {@code s3}.
+         */
+        private String artifactStore = "local";
+
+        private Valkey valkey = new Valkey();
+        private Node node = new Node();
+
+        private transient String cachedNodeId;
+
+        public NodeRole resolvedRole() {
+            if (node == null || node.getRole() == null) {
+                return NodeRole.BOTH;
+            }
+            String value = node.getRole().trim().toUpperCase(Locale.ROOT);
+            try {
+                return NodeRole.valueOf(value);
+            } catch (IllegalArgumentException ex) {
+                return NodeRole.BOTH;
+            }
+        }
+
+        public synchronized String resolvedNodeId() {
+            if (node != null && node.getId() != null && !node.getId().isBlank()) {
+                return node.getId();
+            }
+            if (cachedNodeId == null) {
+                cachedNodeId = UUID.randomUUID().toString();
+            }
+            return cachedNodeId;
+        }
+
+        public enum NodeRole {
+            WEB,
+            WORKER,
+            BOTH
+        }
+
+        @Data
+        public static class Valkey {
+            /**
+             * {@code redis://host:6379} or {@code rediss://...} for TLS. Required when cluster mode
+             * is on and backplane is valkey.
+             */
+            private String url = "";
+
+            private Tls tls = new Tls();
+
+            @Data
+            public static class Tls {
+                /**
+                 * When {@code true}, skip Valkey/Redis TLS certificate verification (dev/test
+                 * only). Leave {@code false} in production.
+                 */
+                private boolean skipCertVerification = false;
+            }
+        }
+
+        @Data
+        public static class Node {
+            /** Optional explicit node id. Blank = auto-generated UUID at startup. */
+            private String id = "";
+
+            /** {@code web} | {@code worker} | {@code both}. */
+            private String role = "both";
+
+            /**
+             * Internal cluster address advertised in the instance registry (host:port). Blank =
+             * derived at startup.
+             */
+            private String internalAddress = "";
+
+            /** {@code http} | {@code https} - scheme used when peers call this node. */
+            private String scheme = "http";
+
+            /** Heartbeat publish interval for the instance registry, in milliseconds. */
+            private long heartbeatIntervalMs = 5000;
+        }
+    }
+
+    /**
+     * HTTP timeouts for loopback calls to internal Stirling API endpoints, used by the AI workflow
+     * executor and the pipeline processor. A bounded read timeout prevents a hung tool (e.g. an
+     * infinite loop in a PDF processing service) from stalling the entire chat workflow forever.
+     * Tools that legitimately need longer than the read timeout should be invoked through the async
+     * job executor instead of synchronously.
+     */
+    @Data
+    public static class InternalApi {
+        private int connectTimeoutSeconds = 10;
+        private int readTimeoutSeconds = 300;
+    }
+
+    @Data
+    public static class Legal {
+        private String termsAndConditions;
+        private String privacyPolicy;
+        private String accessibilityStatement;
+        private String cookiePolicy;
+        private String impressum;
+        private LoginAgreement loginAgreement = new LoginAgreement();
+
+        @Data
+        public static class LoginAgreement {
+            private boolean enabled = false;
+            private boolean showInAnonymousMode = true;
+            private String fallbackText = "";
+        }
+    }
+
+    @Data
+    public static class Security {
+        private boolean enableLogin;
+        private InitialLogin initialLogin = new InitialLogin();
+        private OAUTH2 oauth2 = new OAUTH2();
+        private SAML2 saml2 = new SAML2();
+        private int loginAttemptCount;
+        private long loginResetTimeMinutes;
+        private String loginMethod = "all";
+        private String customGlobalAPIKey;
+        private Jwt jwt = new Jwt();
+        private Validation validation = new Validation();
+        private Timestamp timestamp = new Timestamp();
+        private String xFrameOptions = "DENY";
+
+        public Boolean isAltLogin() {
+            return saml2.getEnabled() || oauth2.getEnabled();
+        }
+
+        public enum LoginMethods {
+            ALL("all"),
+            NORMAL("normal"),
+            OAUTH2("oauth2"),
+            SAML2("saml2");
+
+            private String method;
+
+            LoginMethods(String method) {
+                this.method = method;
+            }
+
+            @Override
+            public String toString() {
+                return method;
+            }
+        }
+
+        public boolean isUserPass() {
+            return (loginMethod.equalsIgnoreCase(LoginMethods.NORMAL.toString())
+                    || loginMethod.equalsIgnoreCase(LoginMethods.ALL.toString()));
+        }
+
+        public boolean isOauth2Active() {
+            return (oauth2 != null
+                    && oauth2.getEnabled()
+                    && !loginMethod.equalsIgnoreCase(LoginMethods.NORMAL.toString()));
+        }
+
+        public boolean isSaml2Active() {
+            return (saml2 != null
+                    && saml2.getEnabled()
+                    && !loginMethod.equalsIgnoreCase(LoginMethods.NORMAL.toString()));
+        }
+
+        @Data
+        public static class InitialLogin {
+            private String username;
+            @ToString.Exclude private String password;
+        }
+
+        @Getter
+        @Setter
+        @ToString
+        public static class SAML2 {
+            private String provider;
+            private Boolean enabled = false;
+            private Boolean autoCreateUser = true;
+            private Boolean blockRegistration = false;
+            private String registrationId = "stirling";
+
+            @ToString.Exclude
+            @JsonProperty("idpMetadataUri")
+            private String idpMetadataUri;
+
+            private String idpSingleLogoutUrl;
+            private String idpSingleLoginUrl;
+            private String idpIssuer;
+
+            @JsonProperty("idpCert")
+            private String idpCert;
+
+            @ToString.Exclude
+            @JsonProperty("privateKey")
+            private String privateKey;
+
+            @ToString.Exclude
+            @JsonProperty("spCert")
+            private String spCert;
+
+            @JsonIgnore
+            public InputStream getIdpMetadataUri() throws IOException {
+                if (idpMetadataUri.startsWith("classpath:")) {
+                    return new ClassPathResource(idpMetadataUri.substring("classpath:".length()))
+                            .getInputStream();
+                }
+                try {
+                    URI uri = new URI(idpMetadataUri);
+                    URL url = uri.toURL();
+                    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                    connection.setRequestMethod("GET");
+                    return connection.getInputStream();
+                } catch (URISyntaxException e) {
+                    throw new IOException("Invalid URI format: " + idpMetadataUri, e);
+                }
+            }
+
+            @JsonIgnore
+            public Resource getSpCert() {
+                if (spCert == null) return null;
+                if (spCert.startsWith("classpath:")) {
+                    return new ClassPathResource(spCert.substring("classpath:".length()));
+                } else {
+                    return new FileSystemResource(spCert);
+                }
+            }
+
+            @JsonIgnore
+            public Resource getIdpCert() {
+                if (idpCert == null) return null;
+                if (idpCert.startsWith("classpath:")) {
+                    return new ClassPathResource(idpCert.substring("classpath:".length()));
+                } else {
+                    return new FileSystemResource(idpCert);
+                }
+            }
+
+            @JsonIgnore
+            public Resource getPrivateKey() {
+                if (privateKey == null) return null;
+                if (privateKey.startsWith("classpath:")) {
+                    return new ClassPathResource(privateKey.substring("classpath:".length()));
+                } else {
+                    return new FileSystemResource(privateKey);
+                }
+            }
+        }
+
+        @Data
+        public static class OAUTH2 {
+            private Boolean enabled = false;
+            private String issuer;
+            private String clientId;
+            @ToString.Exclude private String clientSecret;
+            private Boolean autoCreateUser = true;
+            private Boolean blockRegistration = false;
+            private String useAsUsername;
+            private Collection<String> scopes = new ArrayList<>();
+            private String provider;
+            private Client client = new Client();
+
+            /**
+             * When true, the OAuth2/OIDC login flow logs the full set of ID token and UserInfo
+             * claims at INFO level (and again at ERROR level if the username attribute cannot be
+             * resolved). Used to diagnose provider misconfiguration (for example ADFS not returning
+             * an {@code email} claim). WARNING: writes PII (sub, email, name) to application logs.
+             * Leave disabled in production; enable only while actively troubleshooting and disable
+             * again afterwards.
+             */
+            private Boolean debugLogging = false;
+
+            public void setScopes(String scopes) {
+                List<String> scopesList =
+                        Arrays.stream(scopes.split(",")).map(String::trim).toList();
+                this.scopes.addAll(scopesList);
+            }
+
+            protected boolean isValid(String value, String name) {
+                return value != null && !value.trim().isEmpty();
+            }
+
+            protected boolean isValid(Collection<String> value, String name) {
+                return value != null && !value.isEmpty();
+            }
+
+            public boolean isSettingsValid() {
+                return !ValidationUtils.isStringEmpty(this.issuer)
+                        && !ValidationUtils.isStringEmpty(this.clientId)
+                        && !ValidationUtils.isStringEmpty(this.clientSecret)
+                        && !ValidationUtils.isCollectionEmpty(this.scopes)
+                        && !ValidationUtils.isStringEmpty(this.useAsUsername);
+            }
+
+            @Data
+            public static class Client {
+                private GoogleProvider google = new GoogleProvider();
+                private GitHubProvider github = new GitHubProvider();
+                private KeycloakProvider keycloak = new KeycloakProvider();
+
+                public Provider get(String registrationId) throws UnsupportedProviderException {
+                    return switch (registrationId.toLowerCase(Locale.ROOT)) {
+                        case "google" -> getGoogle();
+                        case "github" -> getGithub();
+                        case "keycloak" -> getKeycloak();
+                        default ->
+                                throw new UnsupportedProviderException(
+                                        "Logout from the provider "
+                                                + registrationId
+                                                + " is not supported. Report it at"
+                                                + " https://github.com/Stirling-Tools/Stirling-PDF/issues");
+                    };
+                }
+            }
+        }
+
+        /**
+         * JWT token configuration.
+         *
+         * <p><b>BREAKING CHANGE (v2.0):</b> Default token expiry increased from 12 hours (720
+         * minutes) to 24 hours (1440 minutes). If you require the previous behavior, explicitly set
+         * {@code tokenExpiryMinutes: 720} in your configuration.
+         */
+        @Data
+        public static class Jwt {
+            private boolean enableKeystore = true;
+            private boolean enableKeyCleanup = true;
+
+            /**
+             * JWT access token lifetime in minutes for web clients.
+             *
+             * <p>Default: {@value JwtConstants#DEFAULT_TOKEN_EXPIRY_MINUTES} minutes (24 hours).
+             *
+             * <p><b>BREAKING CHANGE:</b> Previously hardcoded to 720 minutes (12 hours). Now
+             * defaults to 1440 minutes (24 hours).
+             */
+            private int tokenExpiryMinutes = JwtConstants.DEFAULT_TOKEN_EXPIRY_MINUTES;
+
+            /**
+             * JWT access token lifetime in minutes for desktop clients (Tauri app).
+             *
+             * <p>Desktop clients are automatically detected via User-Agent header and receive
+             * longer-lived tokens because they run on personal devices with OS-level encrypted
+             * storage (macOS Keychain, Windows Credential Manager, Linux Secret Service).
+             *
+             * <p>This provides better UX (login once per month) while maintaining security through
+             * device encryption and secure storage, matching the behavior of popular desktop apps
+             * like Slack, Discord, VS Code, etc.
+             *
+             * <p>Default: 43200 minutes (30 days).
+             */
+            private int desktopTokenExpiryMinutes = 43200;
+
+            /**
+             * Allowed clock skew in seconds for JWT validation.
+             *
+             * <p>Tolerates small time drift between client and server clocks. Tokens that are
+             * slightly expired or slightly in the future (within this window) will still be
+             * accepted.
+             *
+             * <p>Default: {@value JwtConstants#DEFAULT_CLOCK_SKEW_SECONDS} seconds.
+             */
+            private int allowedClockSkewSeconds = JwtConstants.DEFAULT_CLOCK_SKEW_SECONDS;
+
+            /**
+             * Grace period in minutes for refreshing expired tokens.
+             *
+             * <p>Allows token refresh using an expired access token if the token expired within
+             * this many minutes. This provides better UX by allowing users to refresh slightly
+             * expired tokens without re-authentication.
+             *
+             * <p>Rate limiting is applied to prevent abuse of expired tokens within the grace
+             * window (max {@value JwtConstants#MAX_REFRESH_ATTEMPTS_IN_GRACE} attempts).
+             *
+             * <p>Default: {@value JwtConstants#DEFAULT_REFRESH_GRACE_MINUTES} minutes.
+             */
+            private int refreshGraceMinutes = JwtConstants.DEFAULT_REFRESH_GRACE_MINUTES;
+
+            /**
+             * Calculate number of days to retain old JWT signing keys.
+             *
+             * <p>Automatically calculated based on the longest token lifetime plus a proportional
+             * safety buffer. Keys must be retained for at least as long as the tokens they signed
+             * remain valid, otherwise token verification will fail.
+             *
+             * <p>Formula: ceil((maxTokenExpiry + 10% buffer + refreshGrace + clockSkew) / 1440)
+             *
+             * <p>The buffer includes:
+             *
+             * <ul>
+             *   <li>10% of token lifetime (scales with token duration)
+             *   <li>Token refresh grace period ({@link #refreshGraceMinutes})
+             *   <li>Clock skew tolerance ({@link #allowedClockSkewSeconds} converted to minutes)
+             * </ul>
+             *
+             * @return calculated key retention period in days
+             */
+            public int getKeyRetentionDays() {
+                final int MINUTES_PER_DAY = 1440;
+                final double BUFFER_PERCENTAGE = 0.10; // 10% buffer
+
+                int maxTokenExpiryMinutes = Math.max(tokenExpiryMinutes, desktopTokenExpiryMinutes);
+
+                // Add 10% buffer (scales with token lifetime)
+                int bufferMinutes = (int) Math.ceil(maxTokenExpiryMinutes * BUFFER_PERCENTAGE);
+
+                // Add refresh grace period
+                bufferMinutes += refreshGraceMinutes;
+
+                // Add clock skew (convert seconds to minutes, round up)
+                bufferMinutes += (int) Math.ceil(allowedClockSkewSeconds / 60.0);
+
+                // Total retention in minutes, convert to days (round up)
+                int totalMinutes = maxTokenExpiryMinutes + bufferMinutes;
+                return (int) Math.ceil(totalMinutes / (double) MINUTES_PER_DAY);
+            }
+        }
+
+        @Data
+        public static class Validation {
+            private Trust trust = new Trust();
+            private boolean allowAIA = false;
+            private Aatl aatl = new Aatl();
+            private Eutl eutl = new Eutl();
+            private Revocation revocation = new Revocation();
+
+            @Data
+            public static class Trust {
+                private boolean serverAsAnchor = true;
+                private boolean useSystemTrust = true;
+                private boolean useMozillaBundle = true;
+                private boolean useAATL = false;
+                private boolean useEUTL = false;
+            }
+
+            @Data
+            public static class Aatl {
+                private String url = "https://trustlist.adobe.com/tl.pdf";
+            }
+
+            @Data
+            public static class Eutl {
+                private String lotlUrl = "https://ec.europa.eu/tools/lotl/eu-lotl.xml";
+                private boolean acceptTransitional = false;
+            }
+
+            @Data
+            public static class Revocation {
+                private String mode = "none";
+                private boolean hardFail = false;
+            }
+        }
+
+        @Data
+        public static class Timestamp {
+            private String defaultTsaUrl = "http://timestamp.digicert.com";
+            private List<String> customTsaUrls = new ArrayList<>();
+        }
+    }
+
+    @Data
+    public static class System {
+        private String defaultLocale;
+        private boolean googlevisibility;
+        private boolean showUpdate = true;
+        private boolean showUpdateOnlyAdmin = true;
+        private boolean showSettingsWhenNoLogin = true;
+        private boolean customHTMLFiles;
+        private String tessdataDir;
+        private boolean enableAlphaFunctionality;
+        private Boolean enableAnalytics;
+        private Boolean enablePosthog;
+        private Boolean enableScarf;
+        private Boolean enableDesktopInstallSlide = true;
+        private Datasource datasource;
+        private boolean disableSanitize;
+        private int maxDPI = 500;
+        private boolean enableUrlToPDF;
+        private Html html = new Html();
+        private CustomPaths customPaths = new CustomPaths();
+        private String fileUploadLimit;
+        private TempFileManagement tempFileManagement = new TempFileManagement();
+        private DatabaseBackup databaseBackup = new DatabaseBackup();
+        private List<String> corsAllowedOrigins = new ArrayList<>();
+        private String backendUrl; // Backend base URL for SAML/OAuth/API callbacks (e.g.
+        // 'http://localhost:8080', 'https://api.example.com'). Required for
+        // SSO.
+        private String frontendUrl; // Frontend URL for invite email links (e.g.
+
+        // 'https://app.example.com'). If not set, falls back to backendUrl.
+        private boolean enableMobileScanner = true; // Enable mobile phone QR code upload feature
+        private MobileScannerSettings mobileScannerSettings = new MobileScannerSettings();
+        private ServerCertificate serverCertificate = new ServerCertificate();
+
+        @Data
+        public static class MobileScannerSettings {
+            private boolean convertToPdf = true; // Whether to automatically convert images to PDF
+            private String imageResolution = "full"; // Options: "full", "reduced"
+            private String pageFormat = "A4"; // Options: "keep", "A4", "letter"
+            private boolean stretchToFit = false; // Whether to stretch image to fill page
+        }
+
+        @Data
+        public static class ServerCertificate {
+            private boolean enabled =
+                    true; // Enable server-side "Sign with Stirling-PDF" certificate
+            private String organizationName = "Stirling PDF Inc";
+            private int validity = 365; // Certificate validity in days
+            private boolean regenerateOnStartup =
+                    false; // Generate a new certificate on each startup
+        }
+
+        public boolean isAnalyticsEnabled() {
+            return this.enableAnalytics != null && this.enableAnalytics;
+        }
+
+        public boolean isPosthogEnabled() {
+            // Treat null as enabled when analytics is enabled
+            return this.isAnalyticsEnabled() && (this.enablePosthog == null || this.enablePosthog);
+        }
+
+        public boolean isScarfEnabled() {
+            // Treat null as enabled when analytics is enabled
+            return this.isAnalyticsEnabled() && (this.enableScarf == null || this.enableScarf);
+        }
+    }
+
+    @Data
+    public static class Storage {
+        private boolean enabled = false;
+        private String provider = "local";
+        private Local local = new Local();
+        private S3 s3 = new S3();
+        private Quotas quotas = new Quotas();
+        private Sharing sharing = new Sharing();
+        private Signing signing = new Signing();
+
+        @Data
+        public static class Local {
+            private String basePath = InstallationPathConfig.getPath() + "storage";
+        }
+
+        @Data
+        public static class S3 {
+            /**
+             * Optional custom endpoint (e.g. {@code https://<account>.r2.cloudflarestorage.com},
+             * {@code https://<project>.supabase.co/storage/v1/s3}, or {@code http://localhost:9000}
+             * for MinIO). Blank = use AWS regional default.
+             */
+            private String endpoint = "";
+
+            private String bucket = "";
+
+            private String region = "us-east-1";
+
+            private String accessKey = "";
+            private String secretKey = "";
+
+            /**
+             * When {@code true} use path-style URLs ({@code <endpoint>/<bucket>/<key>}) instead of
+             * virtual-hosted ({@code <bucket>.<endpoint>/<key>}). MinIO and most S3-compatible
+             * gateways require path-style; AWS S3 prefers virtual-hosted.
+             */
+            private boolean pathStyleAccess = false;
+
+            /**
+             * When {@code false} (default), {@code endpoint} hostnames that resolve to private,
+             * loopback, or link-local addresses are rejected at startup to block SSRF attacks via
+             * the cloud metadata service (e.g. {@code http://169.254.169.254/}). Set to {@code
+             * true} to opt in for MinIO / in-cluster S3 endpoints on private networks.
+             */
+            private boolean allowPrivateEndpoints = false;
+
+            /**
+             * Controls when the SDK adds an {@code x-amz-checksum-*} header on PUT/UploadPart.
+             * Default {@code WHEN_SUPPORTED} (the SDK default since 2.30) makes the SDK send a
+             * CRC32 checksum on every upload - this works on AWS S3, MinIO, current Supabase,
+             * Backblaze B2 (post-July-2025), and modern R2. Set to {@code WHEN_REQUIRED} to
+             * suppress the auto-checksum on vendors that reject unknown {@code x-amz-checksum-*}
+             * headers (older Backblaze B2, some R2 corner cases, GCS S3 endpoint). Invalid values
+             * fall back to {@code WHEN_SUPPORTED}.
+             */
+            private String requestChecksumCalculation = "WHEN_SUPPORTED";
+
+            /**
+             * Controls when the SDK validates returned {@code x-amz-checksum-*} headers on GET
+             * responses. Default {@code WHEN_SUPPORTED}. Set to {@code WHEN_REQUIRED} if your
+             * vendor never returns these headers and you see false-positive checksum-mismatch
+             * errors. Invalid values fall back to {@code WHEN_SUPPORTED}.
+             */
+            private String responseChecksumValidation = "WHEN_SUPPORTED";
+        }
+
+        @Data
+        public static class Sharing {
+            private boolean enabled = false;
+            private boolean linkEnabled = true;
+            private boolean emailEnabled = false;
+            private int linkExpirationDays = 3;
+        }
+
+        @Data
+        public static class Quotas {
+            private long maxStorageMbPerUser = -1;
+            private long maxStorageMbTotal = -1;
+            private long maxFileMb = -1;
+        }
+
+        @Data
+        public static class Signing {
+            private boolean enabled = false;
+
+            // Signing user-picker scope: 'org' (default) = whole instance, anything else =
+            // caller's team only (fail-closed). The saas profile pins 'team'.
+            private String userListScope = "org";
+        }
+    }
+
+    @Data
+    public static class DatabaseBackup {
+        private String cron = "0 0 0 * * ?"; // daily at midnight
+    }
+
+    @Data
+    public static class CustomPaths {
+        private Pipeline pipeline = new Pipeline();
+        private Operations operations = new Operations();
+
+        @Data
+        public static class Pipeline {
+            private String pipelineDir;
+            private String watchedFoldersDir;
+            private List<String> watchedFoldersDirs = new ArrayList<>();
+            private String finishedFoldersDir;
+            private String webUIConfigsDir;
+        }
+
+        @Data
+        public static class Operations {
+            private String weasyprint;
+            private String unoconvert;
+            private String calibre;
+            private String ocrmypdf;
+            private String soffice;
+        }
+    }
+
+    @Data
+    public static class TempFileManagement {
+        @JsonProperty("baseTmpDir")
+        private String baseTmpDir = "";
+
+        @JsonProperty("libreofficeDir")
+        private String libreofficeDir = "";
+
+        private String systemTempDir = "";
+        private String prefix = "stirling-pdf-";
+        private long maxAgeHours = 24;
+        private long cleanupIntervalMinutes = 30;
+        private boolean startupCleanup = true;
+        private boolean cleanupSystemTemp = false;
+
+        @JsonIgnore
+        public String getBaseTmpDir() {
+            if (baseTmpDir != null && !baseTmpDir.isEmpty()) {
+                return baseTmpDir;
+            }
+            String tmp = java.lang.System.getProperty("java.io.tmpdir");
+            return new File(tmp, "stirling-pdf").getPath();
+        }
+
+        @JsonIgnore
+        public String getLibreofficeDir() {
+            if (libreofficeDir != null && !libreofficeDir.isEmpty()) {
+                return libreofficeDir;
+            }
+            return new File(getBaseTmpDir(), "libreoffice").getPath();
+        }
+    }
+
+    @Data
+    public static class Html {
+        private UrlSecurity urlSecurity = new UrlSecurity();
+
+        @Data
+        public static class UrlSecurity {
+            private boolean enabled = true;
+            private SsrfProtectionLevel level = SsrfProtectionLevel.MEDIUM; // MAX, MEDIUM, OFF
+            private List<String> allowedDomains = new ArrayList<>();
+            private List<String> blockedDomains = new ArrayList<>();
+            private List<String> internalTlds =
+                    Arrays.asList(".local", ".internal", ".corp", ".home");
+            private boolean blockPrivateNetworks = true;
+            private boolean blockLocalhost = true;
+            private boolean blockLinkLocal = true;
+            private boolean blockCloudMetadata = true;
+        }
+    }
+
+    @Data
+    public static class Datasource {
+        private boolean enableCustomDatabase;
+        private String customDatabaseUrl;
+        private String type;
+        private String hostName;
+        private Integer port;
+        private String name;
+        private String username;
+        @ToString.Exclude private String password;
+    }
+
+    public enum Driver {
+        H2("h2"),
+        POSTGRESQL("postgresql"),
+        ORACLE("oracle"),
+        MYSQL("mysql");
+
+        private final String driverName;
+
+        Driver(String driverName) {
+            this.driverName = driverName;
+        }
+
+        @Override
+        public String toString() {
+            return """
+            Driver {
+              driverName='%s'
+            }
+            """
+                    .formatted(driverName);
+        }
+    }
+
+    @Data
+    public static class Ui {
+        private String appNameNavbar;
+        private List<String> languages;
+        private String logoStyle = "classic"; // Options: "classic" (default) or "modern"
+        private boolean defaultHideUnavailableTools = false;
+        private boolean defaultHideUnavailableConversions = false;
+        private HideDisabledTools hideDisabledTools = new HideDisabledTools();
+
+        public String getAppNameNavbar() {
+            return appNameNavbar != null && !appNameNavbar.trim().isEmpty() ? appNameNavbar : null;
+        }
+
+        public String getLogoStyle() {
+            // Validate and return either "modern" or "classic"
+            if ("modern".equalsIgnoreCase(logoStyle)) {
+                return "modern";
+            }
+            return "classic"; // default
+        }
+
+        @Data
+        public static class HideDisabledTools {
+            private boolean googleDrive = false;
+            private boolean mobileQRScanner = false;
+        }
+    }
+
+    @Data
+    public static class Endpoints {
+        private List<String> toRemove;
+        private List<String> groupsToRemove;
+    }
+
+    @Data
+    public static class Metrics {
+        private boolean enabled = true;
+    }
+
+    @Data
+    public static class AutomaticallyGenerated {
+        @ToString.Exclude private String key;
+        private String UUID;
+        private String appVersion;
+        private Boolean isNewServer;
+    }
+
+    // TODO: Remove post migration
+    @Data
+    @Deprecated(since = "0.45.0")
+    public static class EnterpriseEdition {
+        private boolean enabled;
+        @ToString.Exclude private String key;
+        private int maxUsers;
+        private boolean ssoAutoLogin;
+        private CustomMetadata customMetadata = new CustomMetadata();
+
+        @Deprecated
+        @Data
+        public static class CustomMetadata {
+            private boolean autoUpdateMetadata;
+            private String author;
+            private String creator;
+            private String producer;
+
+            @Deprecated
+            public String getCreator() {
+                return creator == null || creator.trim().isEmpty() ? "Stirling-PDF" : creator;
+            }
+
+            @Deprecated
+            public String getProducer() {
+                return producer == null || producer.trim().isEmpty() ? "Stirling-PDF" : producer;
+            }
+        }
+    }
+
+    /**
+     * Mail server configuration properties.
+     *
+     * @since 0.46.1
+     */
+    @Data
+    public static class Mail {
+        private boolean enabled;
+        private boolean enableInvites = false;
+        private int inviteLinkExpiryHours = 72; // Default: 72 hours (3 days)
+        private String host;
+        private int port = 587;
+        private String username;
+        @ToString.Exclude private String password;
+        private String from;
+        // STARTTLS upgrades a plain SMTP connection to TLS after connecting (RFC 3207)
+        private Boolean startTlsEnable = true;
+        private Boolean startTlsRequired;
+        // SSL/TLS wrapper for implicit TLS (typically port 465)
+        private Boolean sslEnable;
+        // Hostnames or patterns (e.g., "smtp.example.com" or "*") to trust for TLS certificates;
+        // defaults to "*" (trust all) when not set
+        private String sslTrust;
+        // Enables hostname verification for TLS connections
+        private Boolean sslCheckServerIdentity;
+    }
+
+    /**
+     * Telegram bot configuration properties.
+     *
+     * @since 2.2.x
+     */
+    @Data
+    public static class Telegram {
+        private Boolean enabled = false;
+        @ToString.Exclude private String botToken;
+        private String botUsername;
+        private String pipelineInboxFolder = "telegram";
+        private Boolean customFolderSuffix = true;
+        private Boolean enableAllowUserIDs = true;
+        private List<Long> allowUserIDs = new ArrayList<>();
+        private Boolean enableAllowChannelIDs = true;
+        private List<Long> allowChannelIDs = new ArrayList<>();
+        private long processingTimeoutSeconds = 180;
+        private long pollingIntervalMillis = 2000;
+        private Feedback feedback = new Feedback();
+
+        /**
+         * Configuration for feedback messages sent by the Telegram bot.
+         *
+         * @since 2.2.x
+         */
+        @Data
+        public static class Feedback {
+            private Channel channel = new Channel();
+            private User user = new User();
+
+            /**
+             * Channel-specific feedback settings.
+             *
+             * @since 2.2.x
+             */
+            @Data
+            public static class Channel {
+                /**
+                 * Set to {@code false} to hide/suppress "no valid document" feedback messages to
+                 * the channel (to avoid spam).
+                 */
+                private Boolean noValidDocument = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress generic error feedback messages to the
+                 * channel (to avoid spam).
+                 */
+                private Boolean errorMessage = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress processing error feedback messages to the
+                 * channel (to avoid spam).
+                 */
+                private Boolean errorProcessing = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress "processing" feedback messages to the
+                 * channel (to avoid spam).
+                 */
+                private Boolean processing = true;
+            }
+
+            /**
+             * User-specific feedback settings.
+             *
+             * @since 2.2.x
+             */
+            @Data
+            public static class User {
+                /**
+                 * Set to {@code false} to hide/suppress "no valid document" feedback messages to
+                 * users (to avoid spam).
+                 */
+                private Boolean noValidDocument = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress generic error feedback messages to users
+                 * (to avoid spam).
+                 */
+                private Boolean errorMessage = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress processing error feedback messages to users
+                 * (to avoid spam).
+                 */
+                private Boolean errorProcessing = true;
+
+                /**
+                 * Set to {@code false} to hide/suppress "processing" feedback messages to users (to
+                 * avoid spam).
+                 */
+                private Boolean processing = true;
+            }
+        }
+    }
+
+    @Data
+    public static class Premium {
+        private boolean enabled;
+        @ToString.Exclude private String key;
+        private int maxUsers;
+        private ProFeatures proFeatures = new ProFeatures();
+        private EnterpriseFeatures enterpriseFeatures = new EnterpriseFeatures();
+
+        @Data
+        public static class ProFeatures {
+            private boolean ssoAutoLogin;
+            private boolean database;
+            private CustomMetadata customMetadata = new CustomMetadata();
+            private GoogleDrive googleDrive = new GoogleDrive();
+
+            @Data
+            public static class GoogleDrive {
+                private boolean enabled = false;
+                private String clientId = "";
+                private String apiKey = "";
+                private String appId = "";
+            }
+
+            @Data
+            public static class CustomMetadata {
+                private boolean autoUpdateMetadata;
+                private String author;
+                private String creator;
+                private String producer;
+
+                public String getCreator() {
+                    return creator == null || creator.trim().isEmpty() ? "Stirling-PDF" : creator;
+                }
+
+                public String getProducer() {
+                    return producer == null || producer.trim().isEmpty()
+                            ? "Stirling-PDF"
+                            : producer;
+                }
+            }
+        }
+
+        @Data
+        public static class EnterpriseFeatures {
+            private PersistentMetrics persistentMetrics = new PersistentMetrics();
+            private Audit audit = new Audit();
+            private DatabaseNotifications databaseNotifications = new DatabaseNotifications();
+
+            @Data
+            public static class DatabaseNotifications {
+                private Backup backups = new Backup();
+                private Imports imports = new Imports();
+
+                @Data
+                public static class Backup {
+                    private boolean successful = false;
+                    private boolean failed = false;
+                }
+
+                @Data
+                public static class Imports {
+                    private boolean successful = false;
+                    private boolean failed = false;
+                }
+            }
+
+            @Data
+            public static class Audit {
+                private boolean enabled = true;
+                private int level = 2; // 0=OFF, 1=BASIC, 2=STANDARD, 3=VERBOSE
+                private int retentionDays = 90;
+                private boolean captureFileHash =
+                        false; // Capture SHA-256 hash of files (increases processing time)
+                private boolean capturePdfAuthor =
+                        false; // Capture PDF author metadata (increases processing time)
+                private boolean captureOperationResults =
+                        false; // Capture operation return values (not recommended, high volume)
+            }
+
+            @Data
+            public static class PersistentMetrics {
+                private boolean enabled;
+                private int retentionDays;
+            }
+        }
+    }
+
+    @Data
+    public static class ProcessExecutor {
+        private SessionLimit sessionLimit = new SessionLimit();
+        private TimeoutMinutes timeoutMinutes = new TimeoutMinutes();
+        private boolean autoUnoServer = true;
+        private List<UnoServerEndpoint> unoServerEndpoints = new ArrayList<>();
+
+        @Data
+        public static class UnoServerEndpoint {
+            private String host = "127.0.0.1";
+            private int port = 2003;
+            private String hostLocation = "auto"; // auto|local|remote
+            private String protocol = "http"; // http|https
+        }
+
+        @Data
+        public static class SessionLimit {
+            private int libreOfficeSessionLimit;
+            private int pdfToHtmlSessionLimit;
+            private int pythonOpenCvSessionLimit;
+            private int weasyPrintSessionLimit;
+            private int installAppSessionLimit;
+            private int calibreSessionLimit;
+            private int imageMagickSessionLimit;
+            private int qpdfSessionLimit;
+            private int tesseractSessionLimit;
+            private int ghostscriptSessionLimit;
+            private int ocrMyPdfSessionLimit;
+            private int ffmpegSessionLimit;
+
+            public int getQpdfSessionLimit() {
+                return qpdfSessionLimit > 0 ? qpdfSessionLimit : 2;
+            }
+
+            public int getTesseractSessionLimit() {
+                return tesseractSessionLimit > 0 ? tesseractSessionLimit : 1;
+            }
+
+            public int getLibreOfficeSessionLimit() {
+                return libreOfficeSessionLimit > 0 ? libreOfficeSessionLimit : 1;
+            }
+
+            public int getPdfToHtmlSessionLimit() {
+                return pdfToHtmlSessionLimit > 0 ? pdfToHtmlSessionLimit : 1;
+            }
+
+            public int getPythonOpenCvSessionLimit() {
+                return pythonOpenCvSessionLimit > 0 ? pythonOpenCvSessionLimit : 8;
+            }
+
+            public int getWeasyPrintSessionLimit() {
+                return weasyPrintSessionLimit > 0 ? weasyPrintSessionLimit : 16;
+            }
+
+            public int getInstallAppSessionLimit() {
+                return installAppSessionLimit > 0 ? installAppSessionLimit : 1;
+            }
+
+            public int getCalibreSessionLimit() {
+                return calibreSessionLimit > 0 ? calibreSessionLimit : 1;
+            }
+
+            public int getImageMagickSessionLimit() {
+                return imageMagickSessionLimit > 0 ? imageMagickSessionLimit : 4;
+            }
+
+            public int getGhostscriptSessionLimit() {
+                return ghostscriptSessionLimit > 0 ? ghostscriptSessionLimit : 8;
+            }
+
+            public int getOcrMyPdfSessionLimit() {
+                return ocrMyPdfSessionLimit > 0 ? ocrMyPdfSessionLimit : 2;
+            }
+
+            public int getFfmpegSessionLimit() {
+                return ffmpegSessionLimit > 0 ? ffmpegSessionLimit : 2;
+            }
+        }
+
+        @Data
+        public static class TimeoutMinutes {
+            @JsonProperty("libreOfficetimeoutMinutes")
+            private long libreOfficeTimeoutMinutes;
+
+            @JsonProperty("pdfToHtmltimeoutMinutes")
+            private long pdfToHtmlTimeoutMinutes;
+
+            @JsonProperty("pythonOpenCvtimeoutMinutes")
+            private long pythonOpenCvTimeoutMinutes;
+
+            @JsonProperty("weasyPrinttimeoutMinutes")
+            private long weasyPrintTimeoutMinutes;
+
+            @JsonProperty("installApptimeoutMinutes")
+            private long installAppTimeoutMinutes;
+
+            @JsonProperty("calibretimeoutMinutes")
+            private long calibreTimeoutMinutes;
+
+            private long imageMagickTimeoutMinutes;
+
+            private long tesseractTimeoutMinutes;
+            private long qpdfTimeoutMinutes;
+            private long ghostscriptTimeoutMinutes;
+            private long ocrMyPdfTimeoutMinutes;
+            private long ffmpegTimeoutMinutes;
+
+            public long getTesseractTimeoutMinutes() {
+                return tesseractTimeoutMinutes > 0 ? tesseractTimeoutMinutes : 30;
+            }
+
+            public long getQpdfTimeoutMinutes() {
+                return qpdfTimeoutMinutes > 0 ? qpdfTimeoutMinutes : 30;
+            }
+
+            public long getLibreOfficeTimeoutMinutes() {
+                return libreOfficeTimeoutMinutes > 0 ? libreOfficeTimeoutMinutes : 30;
+            }
+
+            public long getPdfToHtmlTimeoutMinutes() {
+                return pdfToHtmlTimeoutMinutes > 0 ? pdfToHtmlTimeoutMinutes : 20;
+            }
+
+            public long getPythonOpenCvTimeoutMinutes() {
+                return pythonOpenCvTimeoutMinutes > 0 ? pythonOpenCvTimeoutMinutes : 30;
+            }
+
+            public long getWeasyPrintTimeoutMinutes() {
+                return weasyPrintTimeoutMinutes > 0 ? weasyPrintTimeoutMinutes : 30;
+            }
+
+            public long getInstallAppTimeoutMinutes() {
+                return installAppTimeoutMinutes > 0 ? installAppTimeoutMinutes : 60;
+            }
+
+            public long getCalibreTimeoutMinutes() {
+                return calibreTimeoutMinutes > 0 ? calibreTimeoutMinutes : 30;
+            }
+
+            public long getImageMagickTimeoutMinutes() {
+                return imageMagickTimeoutMinutes > 0 ? imageMagickTimeoutMinutes : 30;
+            }
+
+            public long getGhostscriptTimeoutMinutes() {
+                return ghostscriptTimeoutMinutes > 0 ? ghostscriptTimeoutMinutes : 30;
+            }
+
+            public long getOcrMyPdfTimeoutMinutes() {
+                return ocrMyPdfTimeoutMinutes > 0 ? ocrMyPdfTimeoutMinutes : 30;
+            }
+
+            public long getFfmpegTimeoutMinutes() {
+                return ffmpegTimeoutMinutes > 0 ? ffmpegTimeoutMinutes : 30;
+            }
+        }
+    }
+}

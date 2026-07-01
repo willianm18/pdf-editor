@@ -1,0 +1,61 @@
+# Deploy na VPS: SEM build local, só puxa a imagem já publicada no registry.
+#
+# Uso:
+#   1. Copie este arquivo para a VPS - não precisa do código-fonte.
+#   2. docker compose -f docker-compose.prod.yml pull
+#   3. docker compose -f docker-compose.prod.yml up -d
+#
+# Para publicar uma nova versão da imagem (feito localmente, onde está o código):
+#   docker build -t ghcr.io/willianm18/stirling-pdf-rembg:latest -f docker/embedded/Dockerfile .
+#   docker push ghcr.io/willianm18/stirling-pdf-rembg:latest
+#   (depois atualize a tag na linha "image:" abaixo se mudar a versão)
+
+services:
+  stirling-pdf:
+    image: ghcr.io/willianm18/stirling-pdf-rembg:latest
+    container_name: stirling-pdf
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080$${SYSTEM_ROOTURIPATH:-''}/api/v1/info/status | grep -q 'UP'"]
+      interval: 5s
+      timeout: 10s
+      retries: 16
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./stirling/data:/usr/share/tessdata:rw
+      - ./stirling/config:/configs:rw
+      - ./stirling/logs:/logs:rw
+    environment:
+      DISABLE_ADDITIONAL_FEATURES: "true"
+      SECURITY_ENABLELOGIN: "false"
+      SYSTEM_DEFAULTLOCALE: en-US
+      UI_APPNAME: Stirling-PDF
+      UI_HOMEDESCRIPTION: Stirling-PDF with AI background removal (rembg)
+      UI_APPNAMENAVBAR: Stirling-PDF
+      SYSTEM_MAXFILESIZE: "100"
+      METRICS_ENABLED: "true"
+      REMBG_URL: http://rembg:7000
+    depends_on:
+      - rembg
+    networks:
+      - stirling-network
+
+  rembg:
+    image: danielgatis/rembg:latest
+    container_name: rembg
+    restart: unless-stopped
+    command: ["s", "--host", "0.0.0.0", "--port", "7000", "--no-ui"]
+    environment:
+      U2NET_HOME: /root/.u2net
+    volumes:
+      - rembg-models:/root/.u2net
+    networks:
+      - stirling-network
+
+networks:
+  stirling-network:
+    driver: bridge
+
+volumes:
+  rembg-models:
