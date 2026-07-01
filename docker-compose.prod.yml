@@ -20,8 +20,8 @@ services:
       interval: 5s
       timeout: 10s
       retries: 16
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     volumes:
       - ./stirling/data:/usr/share/tessdata:rw
       - ./stirling/config:/configs:rw
