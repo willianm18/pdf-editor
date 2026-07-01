@@ -27,8 +27,8 @@ services:
       - ./stirling/config:/configs:rw
       - ./stirling/logs:/logs:rw
     environment:
-      DISABLE_ADDITIONAL_FEATURES: "true"
-      SECURITY_ENABLELOGIN: "false"
+      DISABLE_ADDITIONAL_FEATURES: "false"
+      SECURITY_ENABLELOGIN: "true"
       SYSTEM_DEFAULTLOCALE: en-US
       UI_APPNAME: Stirling-PDF
       UI_HOMEDESCRIPTION: Stirling-PDF with AI background removal (rembg)
