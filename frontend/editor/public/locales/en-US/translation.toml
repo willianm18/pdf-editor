@@ -4750,6 +4750,7 @@ title = "Merge Settings Overview"
 
 [mobileScanner]
 addToBatch = "Add to Batch"
+adjustCorners = "Adjust corners"
 back = "Back"
 batchImages = "Batch"
 brightness = "Brightness"

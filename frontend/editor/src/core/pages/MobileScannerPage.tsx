@@ -130,7 +130,7 @@ function CornerAdjustScreen({
     offsetX: 0,
     offsetY: 0,
   });
-  const draggingRef = useRef<CornerKey | null>(null);
+  const [activeCorner, setActiveCorner] = useState<CornerKey | null>(null);
 
   useEffect(() => {
     const updateRect = () => {
@@ -196,23 +196,26 @@ function CornerAdjustScreen({
     (key: CornerKey) => (e: React.PointerEvent) => {
       e.preventDefault();
       (e.target as Element).setPointerCapture(e.pointerId);
-      draggingRef.current = key;
+      setActiveCorner(key);
     },
     [],
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
-      const key = draggingRef.current;
-      if (!key) return;
-      const natural = toNatural({ x: e.clientX, y: e.clientY });
-      setCorners((prev) => ({ ...prev, [key]: natural }));
+      setActiveCorner((key) => {
+        if (key) {
+          const natural = toNatural({ x: e.clientX, y: e.clientY });
+          setCorners((prev) => ({ ...prev, [key]: natural }));
+        }
+        return key;
+      });
     },
     [toNatural],
   );
 
   const handlePointerUp = useCallback(() => {
-    draggingRef.current = null;
+    setActiveCorner(null);
   }, []);
 
   const displayed: Record<CornerKey, Point> = {
@@ -225,6 +228,14 @@ function CornerAdjustScreen({
   const polygonPoints = CORNER_KEYS.map(
     (key) => `${displayed[key].x},${displayed[key].y}`,
   ).join(" ");
+
+  const LOUPE_SIZE = 130;
+  const LOUPE_ZOOM = 2.5;
+  const activeDisplay = activeCorner ? displayed[activeCorner] : null;
+  // Anchor the loupe to the top of the screen, but flip it below when the
+  // finger is dragging a top corner so it never sits under the touch point.
+  const loupeAtBottom =
+    activeDisplay !== null && activeDisplay.y < displayRect.height * 0.35;
 
   return (
     <Box
@@ -297,6 +308,67 @@ function CornerAdjustScreen({
             }}
           />
         ))}
+        {activeDisplay && (
+          <Box
+            style={{
+              position: "absolute",
+              left:
+                (displayRect.width + 2 * displayRect.offsetX) / 2 -
+                LOUPE_SIZE / 2,
+              top: loupeAtBottom
+                ? displayRect.offsetY + displayRect.height - LOUPE_SIZE - 16
+                : displayRect.offsetY + 16,
+              width: LOUPE_SIZE,
+              height: LOUPE_SIZE,
+              borderRadius: "50%",
+              border: "3px solid white",
+              boxShadow: "0 2px 8px rgba(0, 0, 0, 0.5)",
+              overflow: "hidden",
+              pointerEvents: "none",
+              zIndex: 1100,
+              backgroundColor: "#000",
+              backgroundRepeat: "no-repeat",
+              backgroundImage: `url(${dataUrl})`,
+              backgroundSize: `${displayRect.width * LOUPE_ZOOM}px ${displayRect.height * LOUPE_ZOOM}px`,
+              backgroundPosition: `${LOUPE_SIZE / 2 - (activeDisplay.x - displayRect.offsetX) * LOUPE_ZOOM}px ${LOUPE_SIZE / 2 - (activeDisplay.y - displayRect.offsetY) * LOUPE_ZOOM}px`,
+            }}
+          >
+            <Box
+              style={{
+                position: "absolute",
+                left: "50%",
+                top: "50%",
+                width: 20,
+                height: 20,
+                transform: "translate(-50%, -50%)",
+                pointerEvents: "none",
+              }}
+            >
+              <Box
+                style={{
+                  position: "absolute",
+                  left: "50%",
+                  top: 0,
+                  width: 2,
+                  height: "100%",
+                  transform: "translateX(-50%)",
+                  background: "rgba(0, 255, 0, 0.9)",
+                }}
+              />
+              <Box
+                style={{
+                  position: "absolute",
+                  top: "50%",
+                  left: 0,
+                  height: 2,
+                  width: "100%",
+                  transform: "translateY(-50%)",
+                  background: "rgba(0, 255, 0, 0.9)",
+                }}
+              />
+            </Box>
+          </Box>
+        )}
       </Box>
 
       <Box
@@ -385,6 +457,14 @@ export default function MobileScannerPage() {
   const [loadingStatus, setLoadingStatus] = useState<string>("Initializing...");
   const [cameraReady, setCameraReady] = useState(false);
   const [adjustState, setAdjustState] = useState<{
+    dataUrl: string;
+    width: number;
+    height: number;
+    corners: JscanifyCornerPoints;
+  } | null>(null);
+  // Original, un-cropped capture for the current photo, so the corner-adjust
+  // screen can be reopened and re-warped from the source (idempotent).
+  const [rawCapture, setRawCapture] = useState<{
     dataUrl: string;
     width: number;
     height: number;
@@ -1011,6 +1091,13 @@ export default function MobileScannerPage() {
       if (!autoEnhance || !scanner || !openCvReady || !cv) {
         // Auto-enhance disabled or jscanify not available - use original at high quality,
         // skip the corner-adjust step entirely (user explicitly turned off edge detection).
+        // The raw capture is still kept so the user can adjust corners later.
+        setRawCapture({
+          dataUrl: canvas.toDataURL("image/jpeg", 0.95),
+          width: canvas.width,
+          height: canvas.height,
+          corners: defaultCorners(canvas.width, canvas.height),
+        });
         setPreviewBase(canvas.toDataURL("image/jpeg", 0.95));
         return;
       }
@@ -1082,12 +1169,14 @@ export default function MobileScannerPage() {
         );
       }
 
-      setAdjustState({
+      const captured = {
         dataUrl: canvas.toDataURL("image/jpeg", 0.95),
         width: canvas.width,
         height: canvas.height,
         corners,
-      });
+      };
+      setRawCapture(captured);
+      setAdjustState(captured);
     } finally {
       setIsProcessing(false);
     }
@@ -1170,6 +1259,12 @@ export default function MobileScannerPage() {
   const cancelAdjust = useCallback(() => {
     setAdjustState(null);
   }, []);
+
+  // Reopen the corner-adjust screen from the original (un-cropped) capture so
+  // the warp is re-derived from the source and stays idempotent.
+  const reopenAdjust = useCallback(() => {
+    if (rawCapture) setAdjustState(rawCapture);
+  }, [rawCapture]);
 
   /**
    * Run a filter over a base data URL and return a filtered data URL. Passing
@@ -1315,6 +1410,7 @@ export default function MobileScannerPage() {
       setCapturedImages((prev) => [...prev, finalImage]);
       setPreviewBase(null);
       setCurrentPreview(null);
+      setRawCapture(null);
     }
   }, [renderFinalImage]);
 
@@ -1390,6 +1486,7 @@ export default function MobileScannerPage() {
   const retake = useCallback(() => {
     setPreviewBase(null);
     setCurrentPreview(null);
+    setRawCapture(null);
   }, []);
 
   const clearBatch = useCallback(() => {
@@ -1958,6 +2055,16 @@ export default function MobileScannerPage() {
                     />
                   </Box>
                 </>
+              )}
+              {rawCapture && (
+                <Button
+                  variant="default"
+                  onClick={reopenAdjust}
+                  size="lg"
+                  fullWidth
+                >
+                  {t("mobileScanner.adjustCorners", "Adjust corners")}
+                </Button>
               )}
               <Group grow>
                 <Button variant="default" onClick={retake} size="lg">

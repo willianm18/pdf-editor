@@ -4750,6 +4750,7 @@ title = "Visão geral das configurações de mesclagem"
 
 [mobileScanner]
 addToBatch = "Adicionar ao lote"
+adjustCorners = "Ajustar cantos"
 back = "Voltar"
 batchImages = "Lote"
 brightness = "Brilho"
