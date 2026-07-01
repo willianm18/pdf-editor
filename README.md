@@ -23,6 +23,37 @@ Stirling PDF is a powerful, open-source PDF editing platform. Run it as a person
 
 ![Stirling PDF - Dashboard](images/home-light.png)
 
+## This Fork: Real AI Background Removal (rembg)
+
+This fork replaces the naive color-key "Remove white background (make transparent)"
+checkbox (image editor screen) with real AI-based background removal powered by
+[rembg](https://github.com/danielgatis/rembg). Instead of just clearing pixels
+close to white, it detects and removes the actual subject's background — works on
+photos, gradients, and complex backgrounds, not just solid white.
+
+How it works: the checkbox now sends the image to a new backend endpoint
+(`POST /api/v1/misc/remove-image-background`), which forwards it to a `rembg`
+container running the `u2net` model and returns a transparent PNG.
+
+**Deploying this fork:**
+
+- `docker-compose.yml` — local/dev: builds the `stirling-pdf` image from source and
+  the `rembg` image from `docker/rembg/Dockerfile` (the official `danielgatis/rembg`
+  image only publishes `linux/amd64`, so ARM64 hosts need this custom build).
+- `docker-compose.prod.yml` — production/VPS: pulls prebuilt images only, no build
+  step. Publish your own images first:
+  ```bash
+  docker build -t ghcr.io/<you>/stirling-pdf-rembg:latest -f docker/embedded/Dockerfile .
+  docker push ghcr.io/<you>/stirling-pdf-rembg:latest
+
+  docker build -t ghcr.io/<you>/rembg-arm64:latest -f docker/rembg/Dockerfile docker/rembg
+  docker push ghcr.io/<you>/rembg-arm64:latest
+  ```
+  then update the `image:` fields in `docker-compose.prod.yml` accordingly and run
+  `docker compose -f docker-compose.prod.yml up -d`.
+- Only `stirling-pdf` needs a public domain — `rembg` is only reachable internally
+  on the compose network (`http://rembg:7000`) and should never be exposed publicly.
+
 ## Key Capabilities
 
 - **Everywhere you work** - Desktop client, browser UI, and self-hosted server with a private API.
