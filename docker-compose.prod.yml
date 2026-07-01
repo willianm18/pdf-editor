@@ -42,7 +42,7 @@ services:
       - stirling-network
 
   rembg:
-    image: danielgatis/rembg:latest
+    image: ghcr.io/willianm18/rembg-arm64:latest
     container_name: rembg
     restart: unless-stopped
     command: ["s", "--host", "0.0.0.0", "--port", "7000", "--no-ui"]
