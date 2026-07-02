@@ -28,6 +28,13 @@ import Rotate90DegreesCwRoundedIcon from "@mui/icons-material/Rotate90DegreesCwR
 import CropRoundedIcon from "@mui/icons-material/CropRounded";
 import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
 import CheckRoundedIcon from "@mui/icons-material/CheckRounded";
+import AndroidRoundedIcon from "@mui/icons-material/AndroidRounded";
+import { useOs } from "@app/hooks/useOs";
+import {
+  ANDROID_APP_AVAILABLE,
+  ANDROID_APK_URL,
+  ANDROID_APK_VERSION,
+} from "@app/constants/downloads";
 import {
   loadJscanify,
   type JscanifyCornerPoints,
@@ -523,6 +530,10 @@ export default function MobileScannerPage() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const sessionId = searchParams.get("session");
+  const os = useOs();
+  // Offer the native Android app as an alternative to the in-browser scanner —
+  // only on Android (there is no iOS build) and only once a release exists.
+  const showAndroidAppBanner = ANDROID_APP_AVAILABLE && os === "android";
 
   const [mode, setMode] = useState<"choice" | "camera" | "file" | null>(
     "choice",
@@ -1934,6 +1945,57 @@ export default function MobileScannerPage() {
               )}
             </Text>
           </Stack>
+
+          {showAndroidAppBanner && (
+            <Card
+              withBorder
+              radius="md"
+              padding="md"
+              style={{ width: "100%", background: "rgba(105, 240, 174, 0.08)" }}
+            >
+              <Stack gap="xs">
+                <Group gap="xs" wrap="nowrap">
+                  <AndroidRoundedIcon style={{ color: "#2e7d32" }} />
+                  <Text size="sm" fw={700}>
+                    {t(
+                      "mobileScanner.nativeApp.title",
+                      "Native Android app available",
+                    )}
+                  </Text>
+                </Group>
+                <Text size="xs" c="dimmed">
+                  {t(
+                    "mobileScanner.nativeApp.description",
+                    "Native camera with live edge detection — smoother on lower-end phones. Your pages still go only to this server.",
+                  )}
+                </Text>
+                <Group gap="sm" align="center" wrap="wrap">
+                  <Button
+                    component="a"
+                    href={ANDROID_APK_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    size="sm"
+                    radius="md"
+                    color="green"
+                    leftSection={<AndroidRoundedIcon fontSize="small" />}
+                  >
+                    {t("mobileScanner.nativeApp.download", "Download app (Android)")}
+                  </Button>
+                  <Text size="xs" c="dimmed">
+                    {t("mobileScanner.nativeApp.version", "version")}{" "}
+                    {ANDROID_APK_VERSION}
+                  </Text>
+                </Group>
+                <Text size="xs" c="dimmed">
+                  {t(
+                    "mobileScanner.nativeApp.sideloadNote",
+                    "Android will warn about installing outside the Play Store — that's normal for open-source apps.",
+                  )}
+                </Text>
+              </Stack>
+            </Card>
+          )}
 
           <Stack gap="md" style={{ width: "100%" }}>
             {/* capture="environment" opens Android's native rear camera app,

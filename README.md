@@ -75,6 +75,20 @@ Then open: http://localhost:8080
 
 For full installation options (including desktop and Kubernetes), see our [Documentation Guide](https://docs.stirlingpdf.com/#documentation-guide).
 
+## Android scanner app (this fork)
+
+This fork ships a **native Android scanner app** as an alternative to the
+in-browser mobile scanner (`/mobile-scanner`). It uses the phone's native camera
+with live document-edge detection — smoother on lower-end devices — and uploads
+pages to the same session, so the desktop side is unchanged.
+
+- **Download:** [latest APK](https://github.com/willianm18/pdf-editor/releases/latest/download/stirling-scanner.apk) (Android only — on iPhone, use the in-browser scanner).
+- **How it connects:** on the desktop, open the mobile-upload QR dialog; in the app tap *scan QR*, capture your pages, and they upload to your server. Your pages go only to the Stirling-PDF instance encoded in the QR.
+- **Installing:** Android will warn about installing outside the Play Store — that's expected for open-source apps built from this repo.
+- **Source & build:** see [`mobile-scanner-app/`](mobile-scanner-app/README.md). The APK is built locally (`flutter build apk --release`) and published to GitHub Releases by hand; there is no CI build for it.
+
+A download button also appears automatically on the `/mobile-scanner` page when it's opened on an Android device.
+
 ## Resources
 
 - [**Documentation**](https://docs.stirlingpdf.com)

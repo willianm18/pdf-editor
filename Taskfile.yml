@@ -28,6 +28,9 @@ includes:
   pre-commit:
     taskfile: .taskfiles/pre-commit.yml
     dir: .
+  mobile:
+    taskfile: .taskfiles/mobile.yml
+    dir: mobile-scanner-app
 
 tasks:
   # ============================================================

@@ -1,0 +1,29 @@
+version: '3'
+
+# Native Android scanner app (mobile-scanner-app/). Runs from that directory
+# (see the `dir:` on this include in the root Taskfile). There is no CI build —
+# the APK is built locally and published to GitHub Releases by hand.
+
+tasks:
+  build:
+    desc: "Build the release APK (mobile-scanner-app)"
+    cmds:
+      - flutter build apk --release
+      - cmd: echo "APK -> mobile-scanner-app/build/app/outputs/flutter-apk/app-release.apk"
+        silent: true
+
+  release:
+    desc: "Build + publish the APK to a GitHub Release. Usage: task mobile:release VERSION=v1.0.1"
+    preconditions:
+      - sh: '[ -n "{{.VERSION}}" ]'
+        msg: "Set VERSION, e.g. task mobile:release VERSION=v1.0.1 (remember to bump version in pubspec.yaml first)"
+    cmds:
+      - flutter build apk --release
+      # `file#name` renames the uploaded asset to the stable name the web app's
+      # download button links to (releases/latest/download/stirling-scanner.apk).
+      - >-
+        gh release create {{.VERSION}}
+        build/app/outputs/flutter-apk/app-release.apk#stirling-scanner.apk
+        --target deploy-clean
+        --title "Stirling Scanner {{.VERSION}}"
+        --generate-notes
