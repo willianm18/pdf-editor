@@ -1,0 +1,13 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The INTERNET permission is required for development. Specifically,
+         the Flutter tool needs it to communicate with the running application
+         to allow setting breakpoints, to provide hot reload, etc.
+    -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Debug builds only: allow plain HTTP so uploads work against the backend
+         on the local LAN during development. Android blocks cleartext traffic by
+         default since API 28; this override does not apply to release builds, so
+         production with HTTPS needs no such change. -->
+    <application android:usesCleartextTraffic="true"/>
+</manifest>

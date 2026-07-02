@@ -82,6 +82,7 @@ README*
 
 # Separate projects not consumed by the Java/frontend build
 commonforms-onnx/
+mobile-scanner-app/
 
 # Runtime mount points used by docker-compose volumes, not build input
 stirling/
