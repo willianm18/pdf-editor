@@ -1,5 +1,11 @@
 import { getPdfiumModule, saveRawDocument } from "@app/services/pdfiumService";
 import { copyRgbaToBgraHeap } from "@app/utils/pdfiumBitmapUtils";
+import type { WrappedPdfiumModule } from "@embedpdf/pdfium";
+
+// Emscripten runtime members not surfaced by @embedpdf/pdfium's public typings.
+interface PdfiumHeapRuntime {
+  HEAPU8: Uint8Array;
+}
 
 export interface ImageToPdfOptions {
   imageResolution?: "full" | "reduced";
@@ -37,7 +43,14 @@ export async function convertImageToPdf(
       imageBlob = await reduceImageResolution(imageFile, 1200);
     }
 
-    // Decode image to RGBA pixels via canvas
+    // JPEG input can be embedded losslessly as DCTDecode (keeping the original
+    // compressed bytes) instead of re-encoding a decoded RGBA bitmap, which
+    // would balloon the PDF far beyond the source file. Other formats still go
+    // through the bitmap path below.
+    const isJpeg = imageBlob.type === "image/jpeg";
+
+    // Decode image to RGBA pixels via canvas. For JPEG we only need the pixel
+    // dimensions for page sizing/placement, not the RGBA payload itself.
     const decoded = await decodeImageToRgba(imageBlob);
     if (!decoded) {
       throw new Error("Failed to decode image");
@@ -104,34 +117,42 @@ export async function convertImageToPdf(
       const pagePtr = m.FPDFPage_New(docPtr, 0, pageWidth, pageHeight);
       if (!pagePtr) throw new Error("PDFium: failed to create page");
 
-      // Create bitmap from RGBA data (PDFium uses BGRA)
-      const bitmapPtr = m.FPDFBitmap_Create(imageWidth, imageHeight, 1);
-      if (!bitmapPtr) throw new Error("PDFium: failed to create bitmap");
-
-      const bufferPtr = m.FPDFBitmap_GetBuffer(bitmapPtr);
-      const stride = m.FPDFBitmap_GetStride(bitmapPtr);
-
-      // Bulk RGBA → BGRA copy via shared utility
-      copyRgbaToBgraHeap(m, rgba, bufferPtr, imageWidth, imageHeight, stride);
-
       // Create image page object
       const imageObjPtr = m.FPDFPageObj_NewImageObj(docPtr);
       if (!imageObjPtr) {
-        m.FPDFBitmap_Destroy(bitmapPtr);
         throw new Error("PDFium: failed to create image object");
       }
 
-      const setBitmapOk = m.FPDFImageObj_SetBitmap(
-        pagePtr,
-        0,
-        imageObjPtr,
-        bitmapPtr,
-      );
-      m.FPDFBitmap_Destroy(bitmapPtr);
+      const jpegEmbedded =
+        isJpeg && (await embedJpegInline(m, imageObjPtr, imageBlob));
 
-      if (!setBitmapOk) {
-        m.FPDFPageObj_Destroy(imageObjPtr);
-        throw new Error("PDFium: failed to set bitmap on image object");
+      if (!jpegEmbedded) {
+        // Bitmap path (non-JPEG, or graceful fallback if the inline JPEG
+        // embed was unavailable at runtime).
+        const bitmapPtr = m.FPDFBitmap_Create(imageWidth, imageHeight, 1);
+        if (!bitmapPtr) {
+          m.FPDFPageObj_Destroy(imageObjPtr);
+          throw new Error("PDFium: failed to create bitmap");
+        }
+
+        const bufferPtr = m.FPDFBitmap_GetBuffer(bitmapPtr);
+        const stride = m.FPDFBitmap_GetStride(bitmapPtr);
+
+        // Bulk RGBA → BGRA copy via shared utility
+        copyRgbaToBgraHeap(m, rgba, bufferPtr, imageWidth, imageHeight, stride);
+
+        const setBitmapOk = m.FPDFImageObj_SetBitmap(
+          pagePtr,
+          0,
+          imageObjPtr,
+          bitmapPtr,
+        );
+        m.FPDFBitmap_Destroy(bitmapPtr);
+
+        if (!setBitmapOk) {
+          m.FPDFPageObj_Destroy(imageObjPtr);
+          throw new Error("PDFium: failed to set bitmap on image object");
+        }
       }
 
       // Set transformation matrix: scale + translate
@@ -175,6 +196,76 @@ export async function convertImageToPdf(
         cause: error,
       },
     );
+  }
+}
+
+/**
+ * Attach the original JPEG bytes to an image object as DCTDecode via
+ * `FPDFImageObj_LoadJpegFileInline`, preserving the source file's compression
+ * and quality instead of embedding a decoded RGBA bitmap.
+ *
+ * Returns `true` on success. Returns `false` (rather than throwing) if the
+ * inline-JPEG API path is unusable at runtime, so the caller can fall back to
+ * the bitmap path — image→PDF conversion must never break.
+ *
+ * `FPDF_FILEACCESS` (WASM 32-bit, 12 bytes):
+ *   offset 0 → m_FileLen (u32)
+ *   offset 4 → m_GetBlock function pointer
+ *   offset 8 → m_Param (void*, unused — the buffer is captured by the closure)
+ */
+async function embedJpegInline(
+  m: WrappedPdfiumModule,
+  imageObjPtr: number,
+  jpegBlob: Blob,
+): Promise<boolean> {
+  const jpegBytes = new Uint8Array(await jpegBlob.arrayBuffer());
+  const heap = () => (m.pdfium as typeof m.pdfium & PdfiumHeapRuntime).HEAPU8;
+
+  let bufferPtr = 0;
+  let fileAccessPtr = 0;
+  let getBlockFn = 0;
+  try {
+    bufferPtr = m.pdfium.wasmExports.malloc(jpegBytes.length);
+    if (!bufferPtr) return false;
+    heap().set(jpegBytes, bufferPtr);
+
+    // m_GetBlock: int (*)(void* param, unsigned long position,
+    //                     unsigned char* pBuf, unsigned long size)
+    const getBlock = (
+      _param: number,
+      position: number,
+      pBuf: number,
+      size: number,
+    ): number => {
+      heap().copyWithin(
+        pBuf,
+        bufferPtr + position,
+        bufferPtr + position + size,
+      );
+      return 1;
+    };
+    getBlockFn = m.pdfium.addFunction(getBlock, "iiiii");
+
+    fileAccessPtr = m.pdfium.wasmExports.malloc(12);
+    if (!fileAccessPtr) return false;
+    m.pdfium.setValue(fileAccessPtr, jpegBytes.length, "i32"); // m_FileLen
+    m.pdfium.setValue(fileAccessPtr + 4, getBlockFn, "i32"); // m_GetBlock
+    m.pdfium.setValue(fileAccessPtr + 8, 0, "i32"); // m_Param
+
+    // pages null / count 0: the object is not attached to any page yet.
+    // The Inline variant copies the data during this call, so the JPEG buffer
+    // is safe to free immediately afterwards.
+    return m.FPDFImageObj_LoadJpegFileInline(0, 0, imageObjPtr, fileAccessPtr);
+  } catch (error) {
+    console.warn(
+      "PDFium inline JPEG embed unavailable, falling back to bitmap:",
+      error,
+    );
+    return false;
+  } finally {
+    if (bufferPtr) m.pdfium.wasmExports.free(bufferPtr);
+    if (fileAccessPtr) m.pdfium.wasmExports.free(fileAccessPtr);
+    if (getBlockFn) m.pdfium.removeFunction(getBlockFn);
   }
 }
 
