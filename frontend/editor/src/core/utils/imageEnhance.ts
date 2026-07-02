@@ -11,16 +11,25 @@
 /** Selectable enhancement styles offered on the preview screen. */
 export type EnhanceFilter =
   | "magicColor"
+  | "colorDocument"
+  | "clarear"
   | "grayscale"
   | "blackAndWhite"
   | "original";
 
-/** Optional brightness/contrast the UI can layer on top of any filter. */
+/** Optional per-filter fine controls the UI can layer on top of any filter. */
 export interface EnhanceAdjustments {
   /** Additive brightness in pixel units, roughly [-100, 100]. 0 = no change. */
   brightness?: number;
   /** Multiplicative contrast around black, roughly [0.5, 2]. 1 = no change. */
   contrast?: number;
+  /** HSV saturation multiplier for the colour filters. 1 = no change. */
+  saturation?: number;
+  /**
+   * Adaptive-threshold constant `C` for the black & white filter. Higher =
+   * cleaner/whiter background; lower = more ink retained. Default ~12.
+   */
+  bwStrength?: number;
 }
 
 // OpenCV.js colour-conversion and morphology constants (plain runtime numbers).
@@ -34,6 +43,8 @@ const MORPH_ELLIPSE = 2;
 const MORPH_CLOSE = 3;
 const ADAPTIVE_THRESH_GAUSSIAN_C = 1;
 const THRESH_BINARY = 0;
+const COLOR_RGB2LAB = 45;
+const COLOR_LAB2RGB = 57;
 
 interface CvMat {
   delete(): void;
@@ -41,6 +52,11 @@ interface CvMat {
   cols: number;
   data: Uint8Array;
   clone(): CvMat;
+}
+
+interface CvClahe {
+  apply(src: CvMat, dst: CvMat): void;
+  delete(): void;
 }
 
 interface CvMatVector {
@@ -64,6 +80,16 @@ interface CvModule {
   split(src: CvMat, dst: CvMatVector): void;
   merge(src: CvMatVector, dst: CvMat): void;
   convertScaleAbs(src: CvMat, dst: CvMat, alpha: number, beta: number): void;
+  medianBlur(src: CvMat, dst: CvMat, ksize: number): void;
+  GaussianBlur(src: CvMat, dst: CvMat, ksize: CvSize, sigmaX: number): void;
+  addWeighted(
+    src1: CvMat,
+    alpha: number,
+    src2: CvMat,
+    beta: number,
+    gamma: number,
+    dst: CvMat,
+  ): void;
   getStructuringElement(shape: number, ksize: CvSize): CvMat;
   morphologyEx(src: CvMat, dst: CvMat, op: number, kernel: CvMat): void;
   divide(src1: CvMat, src2: CvMat, dst: CvMat, scale: number): void;
@@ -76,6 +102,7 @@ interface CvModule {
     blockSize: number,
     c: number,
   ): void;
+  CLAHE: new (clipLimit: number, tileGridSize: CvSize) => CvClahe;
 }
 
 function getCv(): CvModule {
@@ -165,6 +192,79 @@ export function removeShadow(
   }
 }
 
+/**
+ * Local-contrast pop that keeps colour: run CLAHE on the L channel in LAB
+ * space, leaving a/b untouched. This is the core of the "enhance" look —
+ * text and edges gain punch without shifting hue. Modifies `rgb` in place.
+ */
+function claheOnLuminance(rgb: CvMat, cv: CvModule, clipLimit = 3.0): void {
+  const lab = new cv.Mat();
+  const channels = new cv.MatVector();
+  const clahe = new cv.CLAHE(clipLimit, new cv.Size(8, 8));
+  try {
+    cv.cvtColor(rgb, lab, COLOR_RGB2LAB);
+    cv.split(lab, channels);
+    const l = channels.get(0);
+    const enhanced = new cv.Mat();
+    clahe.apply(l, enhanced);
+    channels.set(0, enhanced);
+    l.delete();
+    cv.merge(channels, lab);
+    cv.cvtColor(lab, rgb, COLOR_LAB2RGB);
+  } finally {
+    lab.delete();
+    channels.delete();
+    clahe.delete();
+  }
+}
+
+/**
+ * Lighten shadows with a gamma curve on the L channel (gamma < 1 brightens),
+ * keeping colour. `cv.LUT` isn't in this OpenCV.js build, so the 256-entry
+ * curve is applied with a JS pass over the single L channel. In place on `rgb`.
+ */
+function lightenLuminance(rgb: CvMat, cv: CvModule, gamma = 0.7): void {
+  const table = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    table[i] = Math.min(255, Math.round(255 * Math.pow(i / 255, gamma)));
+  }
+  const lab = new cv.Mat();
+  const channels = new cv.MatVector();
+  try {
+    cv.cvtColor(rgb, lab, COLOR_RGB2LAB);
+    cv.split(lab, channels);
+    const l = channels.get(0);
+    const curved = l.clone();
+    for (let i = 0; i < curved.data.length; i++) {
+      curved.data[i] = table[curved.data[i]];
+    }
+    channels.set(0, curved);
+    l.delete();
+    cv.merge(channels, lab);
+    cv.cvtColor(lab, rgb, COLOR_LAB2RGB);
+  } finally {
+    lab.delete();
+    channels.delete();
+  }
+}
+
+/**
+ * Unsharp mask: sharpen `src` in place (`src = src*(1+amount) - blur*amount`).
+ * A camera-app-style crispness pass that compensates for the soft frames the
+ * browser capture pipeline produces. Works on 1- or 3-channel `Mat`s.
+ */
+function sharpen(src: CvMat, cv: CvModule, amount = 0.8): void {
+  const blurred = new cv.Mat();
+  try {
+    // ksize (0,0) => derived from sigma; sigma ~2 targets fine document detail.
+    const kSize = new cv.Size(0, 0);
+    cv.GaussianBlur(src, blurred, kSize, 2);
+    cv.addWeighted(src, 1 + amount, blurred, -amount, 0, src);
+  } finally {
+    blurred.delete();
+  }
+}
+
 /** White-balance (gray-world) + auto-contrast + gentle saturation boost. */
 function magicColor(
   rgba: CvMat,
@@ -193,28 +293,36 @@ function magicColor(
     for (let c = 0; c < 3; c++) {
       const ch = channels.get(c);
       const scaled = new cv.Mat();
-      cv.convertScaleAbs(ch, scaled, grayMean / means[c], 0);
+      // Clamp the per-channel gain so a strong colour cast can't blow the
+      // white balance out into an unnatural tint.
+      const gain = Math.min(Math.max(grayMean / means[c], 0.75), 1.35);
+      cv.convertScaleAbs(ch, scaled, gain, 0);
       channels.set(c, scaled);
       ch.delete();
     }
     cv.merge(channels, rgb);
 
-    // Auto-contrast driven by the luminance histogram.
+    // Local-contrast pop (LAB CLAHE) — the "enhance/Melhorar" look.
+    claheOnLuminance(rgb, cv, 3.0);
+
+    // Auto-contrast driven by the luminance histogram (white-point stretch).
     cv.cvtColor(rgb, gray, COLOR_RGBA2GRAY);
     const { alpha, beta } = autoContrastParams(gray);
     cv.convertScaleAbs(rgb, rgb, alpha, beta);
 
-    // Gentle saturation boost in HSV.
+    // Gentle saturation boost in HSV (configurable, softer default).
+    const saturation = adjustments?.saturation ?? 1.15;
     cv.cvtColor(rgb, hsv, COLOR_RGB2HSV);
     cv.split(hsv, hsvChannels);
     const sat = hsvChannels.get(1);
     const boosted = new cv.Mat();
-    cv.convertScaleAbs(sat, boosted, 1.25, 0);
+    cv.convertScaleAbs(sat, boosted, saturation, 0);
     hsvChannels.set(1, boosted);
     sat.delete();
     cv.merge(hsvChannels, hsv);
     cv.cvtColor(hsv, rgb, COLOR_HSV2RGB);
 
+    sharpen(rgb, cv);
     applyAdjustments(rgb, cv, adjustments);
     cv.cvtColor(rgb, out, COLOR_RGB2RGBA);
     return out.clone();
@@ -224,6 +332,99 @@ function magicColor(
     gray.delete();
     hsv.delete();
     hsvChannels.delete();
+    out.delete();
+  }
+}
+
+/**
+ * Shadow-flattened colour document: per-channel illumination normalisation
+ * that keeps colour (stamps, signatures, letterheads, photos) while lifting
+ * shadows, with a gentle saturation boost. Softer than magicColor.
+ */
+function colorDocument(
+  rgba: CvMat,
+  cv: CvModule,
+  adjustments?: EnhanceAdjustments,
+): CvMat {
+  const rgb = new cv.Mat();
+  const gray = new cv.Mat();
+  const background = new cv.Mat();
+  const channels = new cv.MatVector();
+  const hsv = new cv.Mat();
+  const hsvChannels = new cv.MatVector();
+  const out = new cv.Mat();
+  let kernel: CvMat | null = null;
+  try {
+    cv.cvtColor(rgba, rgb, COLOR_RGBA2RGB);
+    cv.cvtColor(rgba, gray, COLOR_RGBA2GRAY);
+
+    // Estimate the illumination background from luminance, then divide each
+    // colour channel by it so lighting flattens but colour ratios survive.
+    const kSize = new cv.Size(21, 21);
+    kernel = cv.getStructuringElement(MORPH_ELLIPSE, kSize);
+    cv.morphologyEx(gray, background, MORPH_CLOSE, kernel);
+    cv.split(rgb, channels);
+    for (let c = 0; c < 3; c++) {
+      const ch = channels.get(c);
+      const normalized = new cv.Mat();
+      cv.divide(ch, background, normalized, 255);
+      channels.set(c, normalized);
+      ch.delete();
+    }
+    cv.merge(channels, rgb);
+
+    // Softer local-contrast pop than magicColor — keeps the natural look.
+    claheOnLuminance(rgb, cv, 2.0);
+
+    // Gentle saturation lift (configurable).
+    const saturation = adjustments?.saturation ?? 1.1;
+    cv.cvtColor(rgb, hsv, COLOR_RGB2HSV);
+    cv.split(hsv, hsvChannels);
+    const sat = hsvChannels.get(1);
+    const boosted = new cv.Mat();
+    cv.convertScaleAbs(sat, boosted, saturation, 0);
+    hsvChannels.set(1, boosted);
+    sat.delete();
+    cv.merge(hsvChannels, hsv);
+    cv.cvtColor(hsv, rgb, COLOR_HSV2RGB);
+
+    sharpen(rgb, cv);
+    applyAdjustments(rgb, cv, adjustments);
+    cv.cvtColor(rgb, out, COLOR_RGB2RGBA);
+    return out.clone();
+  } finally {
+    rgb.delete();
+    gray.delete();
+    background.delete();
+    channels.delete();
+    hsv.delete();
+    hsvChannels.delete();
+    out.delete();
+    kernel?.delete();
+  }
+}
+
+/**
+ * Lighten: brighten shadows with a gentle gamma curve on luminance while
+ * keeping colour — good for underexposed or shadowed captures. A light sharpen
+ * keeps text legible.
+ */
+function clarear(
+  rgba: CvMat,
+  cv: CvModule,
+  adjustments?: EnhanceAdjustments,
+): CvMat {
+  const rgb = new cv.Mat();
+  const out = new cv.Mat();
+  try {
+    cv.cvtColor(rgba, rgb, COLOR_RGBA2RGB);
+    lightenLuminance(rgb, cv, 0.7);
+    sharpen(rgb, cv, 0.4);
+    applyAdjustments(rgb, cv, adjustments);
+    cv.cvtColor(rgb, out, COLOR_RGB2RGBA);
+    return out.clone();
+  } finally {
+    rgb.delete();
     out.delete();
   }
 }
@@ -240,6 +441,7 @@ function grayscale(
     cv.cvtColor(rgba, gray, COLOR_RGBA2GRAY);
     const { alpha, beta } = autoContrastParams(gray);
     cv.convertScaleAbs(gray, gray, alpha, beta);
+    sharpen(gray, cv);
     applyAdjustments(gray, cv, adjustments);
     cv.cvtColor(gray, out, COLOR_GRAY2RGBA);
     return out.clone();
@@ -257,26 +459,33 @@ function blackAndWhite(
 ): CvMat {
   const gray = new cv.Mat();
   let flattened: CvMat | null = null;
+  const denoised = new cv.Mat();
   const binary = new cv.Mat();
   const out = new cv.Mat();
   try {
     cv.cvtColor(rgba, gray, COLOR_RGBA2GRAY);
     applyAdjustments(gray, cv, adjustments);
     flattened = removeShadow(gray, cv);
+    // Median blur kills salt-and-pepper speckle so the threshold stays clean.
+    cv.medianBlur(flattened, denoised, 3);
+    // Larger block smooths the local threshold; C is user-tunable (higher =
+    // cleaner/whiter background, lower = more ink retained).
+    const c = adjustments?.bwStrength ?? 12;
     cv.adaptiveThreshold(
-      flattened,
+      denoised,
       binary,
       255,
       ADAPTIVE_THRESH_GAUSSIAN_C,
       THRESH_BINARY,
-      15,
-      10,
+      25,
+      c,
     );
     cv.cvtColor(binary, out, COLOR_GRAY2RGBA);
     return out.clone();
   } finally {
     gray.delete();
     flattened?.delete();
+    denoised.delete();
     binary.delete();
     out.delete();
   }
@@ -300,6 +509,12 @@ export function enhanceImageData(
     switch (filter) {
       case "magicColor":
         result = magicColor(src, cv, adjustments);
+        break;
+      case "colorDocument":
+        result = colorDocument(src, cv, adjustments);
+        break;
+      case "clarear":
+        result = clarear(src, cv, adjustments);
         break;
       case "grayscale":
         result = grayscale(src, cv, adjustments);
@@ -375,7 +590,9 @@ export function imageDataToDataUrl(
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("Cannot create 2D context");
   ctx.putImageData(imageData, 0, 0);
+  // B&W stays PNG (bilevel — JPEG would ring around text). Colour/grey use JPEG
+  // at 0.82: near-visually-lossless for documents but far smaller than 0.92.
   return filter === "blackAndWhite"
     ? canvas.toDataURL("image/png")
-    : canvas.toDataURL("image/jpeg", 0.92);
+    : canvas.toDataURL("image/jpeg", 0.82);
 }

@@ -11,6 +11,8 @@ import {
   Switch,
   Card,
   Slider,
+  Collapse,
+  UnstyledButton,
 } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { LogoIcon } from "@app/components/shared/LogoIcon";
@@ -21,10 +23,16 @@ import PhotoCameraRoundedIcon from "@mui/icons-material/PhotoCameraRounded";
 import UploadRoundedIcon from "@mui/icons-material/UploadRounded";
 import AddPhotoAlternateRoundedIcon from "@mui/icons-material/AddPhotoAlternateRounded";
 import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
+import ReplayRoundedIcon from "@mui/icons-material/ReplayRounded";
+import Rotate90DegreesCwRoundedIcon from "@mui/icons-material/Rotate90DegreesCwRounded";
+import CropRoundedIcon from "@mui/icons-material/CropRounded";
+import TuneRoundedIcon from "@mui/icons-material/TuneRounded";
+import CheckRoundedIcon from "@mui/icons-material/CheckRounded";
 import {
   loadJscanify,
   type JscanifyCornerPoints,
   type JscanifyScanner,
+  type OpenCVMat,
 } from "@app/utils/loadJscanify";
 import apiClient from "@app/services/apiClient";
 import {
@@ -72,6 +80,8 @@ type CornerKey = (typeof CORNER_KEYS)[number];
 /** Enhancement filters shown in the preview strip, in display order. */
 const FILTER_ORDER: EnhanceFilter[] = [
   "magicColor",
+  "colorDocument",
+  "clarear",
   "grayscale",
   "blackAndWhite",
   "original",
@@ -83,6 +93,13 @@ const THUMB_WIDTH = 120;
 /** Width cap for the on-screen preview; full res is only used on confirm. */
 const PREVIEW_WIDTH = 900;
 
+/**
+ * Long-edge cap for the exported image. A 12 MP capture is overkill for a
+ * document — text stays crisp at ~2200px, and this cuts the file from several
+ * MB to a few hundred KB (CamScanner exports around this size for a reason).
+ */
+const MAX_OUTPUT_LONG_EDGE = 2200;
+
 /** Fallback quadrilateral (5% inset) used when automatic edge detection fails. */
 function defaultCorners(width: number, height: number): JscanifyCornerPoints {
   const marginX = width * 0.05;
@@ -93,6 +110,85 @@ function defaultCorners(width: number, height: number): JscanifyCornerPoints {
     bottomLeftCorner: { x: marginX, y: height - marginY },
     bottomRightCorner: { x: width - marginX, y: height - marginY },
   };
+}
+
+/** Rotates a data URL 90° clockwise, swapping its dimensions. */
+async function rotateDataUrl90(dataUrl: string): Promise<string> {
+  const image = await loadImage(dataUrl);
+  const canvas = document.createElement("canvas");
+  canvas.width = image.naturalHeight;
+  canvas.height = image.naturalWidth;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return dataUrl;
+  ctx.translate(canvas.width, 0);
+  ctx.rotate(Math.PI / 2);
+  ctx.drawImage(image, 0, 0);
+  const rotated = canvas.toDataURL("image/jpeg", 0.95);
+  canvas.width = 0;
+  canvas.height = 0;
+  return rotated;
+}
+
+interface ActionBarButtonProps {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  active?: boolean;
+  variant?: "default" | "confirm";
+}
+
+/** Icon-over-label item for the CamScanner-style preview action bar. */
+function ActionBarButton({
+  icon,
+  label,
+  onClick,
+  disabled = false,
+  active = false,
+  variant = "default",
+}: ActionBarButtonProps) {
+  const isConfirm = variant === "confirm";
+  const color = disabled
+    ? "var(--mantine-color-dimmed)"
+    : active || isConfirm
+      ? "var(--mantine-color-green-6)"
+      : "var(--text-primary)";
+  return (
+    <UnstyledButton
+      onClick={onClick}
+      disabled={disabled}
+      style={{
+        flex: 1,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        gap: 4,
+        padding: "0.5rem 0.25rem",
+        opacity: disabled ? 0.4 : 1,
+        cursor: disabled ? "not-allowed" : "pointer",
+      }}
+    >
+      <Box
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 44,
+          height: 44,
+          borderRadius: "50%",
+          color: isConfirm ? "#fff" : color,
+          background: isConfirm
+            ? "var(--mantine-color-green-6)"
+            : "transparent",
+        }}
+      >
+        {icon}
+      </Box>
+      <Text size="xs" c={color} ta="center">
+        {label}
+      </Text>
+    </UnstyledButton>
+  );
 }
 
 interface CornerAdjustScreenProps {
@@ -439,6 +535,12 @@ export default function MobileScannerPage() {
   const [activeFilter, setActiveFilter] = useState<EnhanceFilter>("magicColor");
   const [brightness, setBrightness] = useState(0);
   const [contrast, setContrast] = useState(1);
+  // Saturation applies to the colour filters; bwStrength (adaptive-threshold C)
+  // to the black & white filter. Both are shown conditionally per filter.
+  const [saturation, setSaturation] = useState(1.15);
+  const [bwStrength, setBwStrength] = useState(12);
+  const [showAdjustments, setShowAdjustments] = useState(false);
+  // TEMP diagnostic: shows which capture path ran and the resolution achieved.
   const [filterThumbs, setFilterThumbs] = useState<
     Partial<Record<EnhanceFilter, string>>
   >({});
@@ -476,6 +578,7 @@ export default function MobileScannerPage() {
   const highlightCanvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const hdCameraInputRef = useRef<HTMLInputElement>(null);
   const scannerRef = useRef<JscanifyScanner | null>(null);
   const highlightIntervalRef = useRef<number | null>(null);
 
@@ -615,7 +718,8 @@ export default function MobileScannerPage() {
         .getUserMedia({
           video: {
             facingMode: "environment",
-            // Request 1080p - good quality without going overboard
+            // 1080p is enough for the live preview: takePhoto delivers the
+            // full-resolution still, and the HD mode bypasses this stream entirely.
             width: { ideal: 1920, max: 1920 },
             height: { ideal: 1080, max: 1080 },
           },
@@ -1068,37 +1172,37 @@ export default function MobileScannerPage() {
     adjustState,
   ]);
 
-  const captureImage = useCallback(async () => {
-    if (!videoRef.current || !canvasRef.current) return;
-
-    setIsProcessing(true);
-
-    try {
-      const video = videoRef.current;
-      const canvas = canvasRef.current;
-      const context = canvas.getContext("2d");
-
-      if (!context) return;
-
-      // Capture raw image from video at full resolution
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-
+  // Shared tail of every capture path (live camera, native HD camera): takes a
+  // full-resolution canvas and either opens the corner-adjust screen after a
+  // best-effort edge detection, or drops straight into the filter preview.
+  const processCapturedCanvas = useCallback(
+    (
+      canvas: HTMLCanvasElement,
+      attemptDetection: boolean,
+      alwaysAdjust = false,
+    ) => {
       const cv = window.cv;
       const scanner = scannerRef.current;
 
-      if (!autoEnhance || !scanner || !openCvReady || !cv) {
-        // Auto-enhance disabled or jscanify not available - use original at high quality,
-        // skip the corner-adjust step entirely (user explicitly turned off edge detection).
-        // The raw capture is still kept so the user can adjust corners later.
-        setRawCapture({
-          dataUrl: canvas.toDataURL("image/jpeg", 0.95),
+      if (!attemptDetection || !scanner || !openCvReady || !cv) {
+        // Detection off or jscanify unavailable — keep the original at high
+        // quality. The HD path (alwaysAdjust) still opens the corner-adjust
+        // screen with default corners so the user can map edges by hand;
+        // otherwise skip straight to preview.
+        // Encode once — at full still resolution the JPEG cost is non-trivial.
+        const dataUrl = canvas.toDataURL("image/jpeg", 0.95);
+        const captured = {
+          dataUrl,
           width: canvas.width,
           height: canvas.height,
           corners: defaultCorners(canvas.width, canvas.height),
-        });
-        setPreviewBase(canvas.toDataURL("image/jpeg", 0.95));
+        };
+        setRawCapture(captured);
+        if (alwaysAdjust) {
+          setAdjustState(captured);
+        } else {
+          setPreviewBase(dataUrl);
+        }
         return;
       }
 
@@ -1118,11 +1222,11 @@ export default function MobileScannerPage() {
         });
         if (!detectionCtx) throw new Error("Cannot create detection context");
 
-        const scale = CAPTURE_DETECTION_WIDTH / video.videoWidth;
+        const scale = CAPTURE_DETECTION_WIDTH / canvas.width;
         detectionCanvas.width = CAPTURE_DETECTION_WIDTH;
-        detectionCanvas.height = Math.round(video.videoHeight * scale);
+        detectionCanvas.height = Math.round(canvas.height * scale);
         detectionCtx.drawImage(
-          video,
+          canvas,
           0,
           0,
           detectionCanvas.width,
@@ -1130,37 +1234,42 @@ export default function MobileScannerPage() {
         );
 
         const mat = cv.imread(detectionCanvas);
-        const contour = scanner.findPaperContour(mat);
-        mat.delete();
+        let contour: OpenCVMat | undefined;
+        try {
+          contour = scanner.findPaperContour(mat);
 
-        if (contour) {
-          const cornerPoints = scanner.getCornerPoints(contour);
-          if (
-            cornerPoints?.topLeftCorner &&
-            cornerPoints.topRightCorner &&
-            cornerPoints.bottomLeftCorner &&
-            cornerPoints.bottomRightCorner
-          ) {
-            const scaleFactor = 1 / scale;
-            corners = {
-              topLeftCorner: {
-                x: cornerPoints.topLeftCorner.x * scaleFactor,
-                y: cornerPoints.topLeftCorner.y * scaleFactor,
-              },
-              topRightCorner: {
-                x: cornerPoints.topRightCorner.x * scaleFactor,
-                y: cornerPoints.topRightCorner.y * scaleFactor,
-              },
-              bottomLeftCorner: {
-                x: cornerPoints.bottomLeftCorner.x * scaleFactor,
-                y: cornerPoints.bottomLeftCorner.y * scaleFactor,
-              },
-              bottomRightCorner: {
-                x: cornerPoints.bottomRightCorner.x * scaleFactor,
-                y: cornerPoints.bottomRightCorner.y * scaleFactor,
-              },
-            };
+          if (contour) {
+            const cornerPoints = scanner.getCornerPoints(contour);
+            if (
+              cornerPoints?.topLeftCorner &&
+              cornerPoints.topRightCorner &&
+              cornerPoints.bottomLeftCorner &&
+              cornerPoints.bottomRightCorner
+            ) {
+              const scaleFactor = 1 / scale;
+              corners = {
+                topLeftCorner: {
+                  x: cornerPoints.topLeftCorner.x * scaleFactor,
+                  y: cornerPoints.topLeftCorner.y * scaleFactor,
+                },
+                topRightCorner: {
+                  x: cornerPoints.topRightCorner.x * scaleFactor,
+                  y: cornerPoints.topRightCorner.y * scaleFactor,
+                },
+                bottomLeftCorner: {
+                  x: cornerPoints.bottomLeftCorner.x * scaleFactor,
+                  y: cornerPoints.bottomLeftCorner.y * scaleFactor,
+                },
+                bottomRightCorner: {
+                  x: cornerPoints.bottomRightCorner.x * scaleFactor,
+                  y: cornerPoints.bottomRightCorner.y * scaleFactor,
+                },
+              };
+            }
           }
+        } finally {
+          mat.delete();
+          contour?.delete();
         }
       } catch (err) {
         console.warn(
@@ -1177,10 +1286,74 @@ export default function MobileScannerPage() {
       };
       setRawCapture(captured);
       setAdjustState(captured);
+    },
+    [openCvReady],
+  );
+
+  const captureImage = useCallback(async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+
+    setIsProcessing(true);
+
+    try {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const context = canvas.getContext("2d");
+
+      if (!context) return;
+
+      // Prefer a full-resolution still from the sensor (ImageCapture.takePhoto),
+      // which on Android/Chrome yields the native photo resolution (12 MP+)
+      // instead of the ~2 MP video preview frame. Any failure falls back to
+      // grabbing the current video frame, so capture can never break.
+      const track = streamRef.current?.getVideoTracks()[0];
+      let usedStill = false;
+      if (typeof window.ImageCapture !== "undefined" && track) {
+        try {
+          const imageCapture = new ImageCapture(track);
+          let photoSettings: PhotoSettings | undefined;
+          try {
+            const caps = await imageCapture.getPhotoCapabilities();
+            if (caps.imageWidth && caps.imageHeight) {
+              photoSettings = {
+                imageWidth: caps.imageWidth.max,
+                imageHeight: caps.imageHeight.max,
+              };
+            }
+          } catch {
+            photoSettings = undefined;
+          }
+          const blob = await imageCapture.takePhoto(photoSettings);
+          // `from-image` applies the JPEG's EXIF orientation so the still isn't
+          // captured sideways on phones that tag rotation instead of baking it in.
+          const bitmap = await createImageBitmap(blob, {
+            imageOrientation: "from-image",
+          });
+          canvas.width = bitmap.width;
+          canvas.height = bitmap.height;
+          context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+          bitmap.close?.();
+          usedStill = true;
+        } catch (err) {
+          console.warn(
+            "[Mobile Scanner] takePhoto failed, using video frame:",
+            err,
+          );
+        }
+      }
+
+      if (!usedStill) {
+        // Fallback: capture the current video preview frame at its resolution.
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }
+
+      processCapturedCanvas(canvas, autoEnhance);
     } finally {
       setIsProcessing(false);
     }
-  }, [autoEnhance, openCvReady]);
+  }, [autoEnhance, processCapturedCanvas]);
 
   const confirmAdjustedCorners = useCallback(
     async (finalCorners: JscanifyCornerPoints) => {
@@ -1268,8 +1441,9 @@ export default function MobileScannerPage() {
 
   /**
    * Run a filter over a base data URL and return a filtered data URL. Passing
-   * `targetWidth` produces a low-res thumbnail; omit it for the full-res output
-   * used when the image is added to the batch or uploaded.
+   * `targetWidth` produces a low-res thumbnail. `maxLongEdge` caps the output
+   * resolution (used for the exported image to keep file size down); omit both
+   * for full native resolution.
    */
   const applyFilter = useCallback(
     async (
@@ -1277,10 +1451,18 @@ export default function MobileScannerPage() {
       filter: EnhanceFilter,
       adjustments: EnhanceAdjustments,
       targetWidth?: number,
+      maxLongEdge?: number,
     ): Promise<string> => {
       const image = await loadImage(baseDataUrl);
       const canvas = imageToCanvas(image);
-      const source = canvasToImageData(canvas, targetWidth);
+      let width = targetWidth;
+      if (width === undefined && maxLongEdge) {
+        const longEdge = Math.max(canvas.width, canvas.height);
+        if (longEdge > maxLongEdge) {
+          width = Math.round((canvas.width * maxLongEdge) / longEdge);
+        }
+      }
+      const source = canvasToImageData(canvas, width);
       const enhanced = enhanceImageData(source, filter, adjustments);
       return imageDataToDataUrl(enhanced, filter);
     },
@@ -1293,6 +1475,8 @@ export default function MobileScannerPage() {
       setActiveFilter("magicColor");
       setBrightness(0);
       setContrast(1);
+      setSaturation(1.15);
+      setBwStrength(12);
     }
   }, [previewBase]);
 
@@ -1328,7 +1512,12 @@ export default function MobileScannerPage() {
   // Derive the displayed preview from base + active filter + adjustments.
   useEffect(() => {
     if (!previewBase) return;
-    const adjustments: EnhanceAdjustments = { brightness, contrast };
+    const adjustments: EnhanceAdjustments = {
+      brightness,
+      contrast,
+      saturation,
+      bwStrength,
+    };
     const isPlainOriginal =
       activeFilter === "original" && brightness === 0 && contrast === 1;
     if (isPlainOriginal || !openCvReady) {
@@ -1358,6 +1547,8 @@ export default function MobileScannerPage() {
     activeFilter,
     brightness,
     contrast,
+    saturation,
+    bwStrength,
     openCvReady,
     applyFilter,
   ]);
@@ -1381,16 +1572,60 @@ export default function MobileScannerPage() {
     [],
   );
 
+  // Native HD camera: the OS camera app returns a photo processed by the
+  // device's real image pipeline. There's no live overlay, so always attempt
+  // detection, then reenter the shared corner-adjust/filter pipeline.
+  const handleHdCameraCapture = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = "";
+      if (!file) return;
+
+      setIsProcessing(true);
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        const dataUrl = event.target?.result;
+        if (typeof dataUrl !== "string") {
+          setIsProcessing(false);
+          return;
+        }
+        try {
+          const img = await loadImage(dataUrl);
+          const canvas = imageToCanvas(img);
+          processCapturedCanvas(canvas, true, true);
+        } catch (err) {
+          console.warn("[Mobile Scanner] HD camera load failed:", err);
+          setPreviewBase(dataUrl);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+      reader.onerror = () => setIsProcessing(false);
+      reader.readAsDataURL(file);
+    },
+    [processCapturedCanvas],
+  );
+
   // Render the current capture at full resolution with the selected filter.
   const renderFinalImage = useCallback(async (): Promise<string | null> => {
     if (!previewBase) return null;
     if (!openCvReady) return previewBase;
-    const adjustments: EnhanceAdjustments = { brightness, contrast };
-    if (activeFilter === "original" && brightness === 0 && contrast === 1) {
-      return previewBase;
-    }
+    const adjustments: EnhanceAdjustments = {
+      brightness,
+      contrast,
+      saturation,
+      bwStrength,
+    };
+    // Always route through applyFilter (even "original") so the export gets
+    // downscaled to MAX_OUTPUT_LONG_EDGE and re-compressed — that's the size win.
     try {
-      return await applyFilter(previewBase, activeFilter, adjustments);
+      return await applyFilter(
+        previewBase,
+        activeFilter,
+        adjustments,
+        undefined,
+        MAX_OUTPUT_LONG_EDGE,
+      );
     } catch (err) {
       console.warn("[Mobile Scanner] Full-res filter failed:", err);
       return previewBase;
@@ -1401,6 +1636,8 @@ export default function MobileScannerPage() {
     activeFilter,
     brightness,
     contrast,
+    saturation,
+    bwStrength,
     applyFilter,
   ]);
 
@@ -1488,6 +1725,25 @@ export default function MobileScannerPage() {
     setCurrentPreview(null);
     setRawCapture(null);
   }, []);
+
+  // Rotates both the displayed preview and the raw capture so corner
+  // adjustment, filters and export stay aligned to the same orientation.
+  const rotate90 = useCallback(async () => {
+    if (!previewBase) return;
+    const rotatedBase = await rotateDataUrl90(previewBase);
+    setPreviewBase(rotatedBase);
+    if (rawCapture) {
+      const rotatedRaw = await rotateDataUrl90(rawCapture.dataUrl);
+      const width = rawCapture.height;
+      const height = rawCapture.width;
+      setRawCapture({
+        dataUrl: rotatedRaw,
+        width,
+        height,
+        corners: defaultCorners(width, height),
+      });
+    }
+  }, [previewBase, rawCapture]);
 
   const clearBatch = useCallback(() => {
     setCapturedImages([]);
@@ -1665,7 +1921,7 @@ export default function MobileScannerPage() {
           gap="lg"
           p="xl"
           align="center"
-          style={{ maxWidth: "500px", margin: "0 auto" }}
+          style={{ width: "100%", maxWidth: "500px", margin: "0 auto" }}
         >
           <Stack gap="xs" align="center">
             <Text size="xl" fw={700} ta="center">
@@ -1680,77 +1936,56 @@ export default function MobileScannerPage() {
           </Stack>
 
           <Stack gap="md" style={{ width: "100%" }}>
-            <Card
-              shadow="sm"
-              padding="xl"
+            {/* capture="environment" opens Android's native rear camera app,
+                which returns a photo processed by the device's real image
+                pipeline (sharper than a WebRTC preview frame). */}
+            <input
+              ref={hdCameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: "none" }}
+              onChange={handleHdCameraCapture}
+            />
+            <Button
+              fullWidth
+              size="xl"
               radius="md"
-              withBorder
-              style={{ cursor: "pointer" }}
-              onClick={() => setMode("camera")}
+              color="green"
+              leftSection={<PhotoCameraRoundedIcon />}
+              onClick={() => hdCameraInputRef.current?.click()}
               styles={{
                 root: {
-                  transition: "transform 0.2s, box-shadow 0.2s",
-                  "&:hover": {
-                    transform: "scale(1.02)",
-                    boxShadow: "var(--mantine-shadow-md)",
-                  },
+                  height: "auto",
+                  paddingBlock: "1.25rem",
+                  width: "100%",
                 },
+                label: { whiteSpace: "normal", width: "100%" },
+                inner: { width: "100%" },
               }}
             >
-              <Stack align="center" gap="md">
-                <PhotoCameraRoundedIcon
-                  style={{
-                    fontSize: "3rem",
-                    color: "var(--mantine-color-blue-6)",
-                  }}
-                />
-                <Text size="lg" fw={600}>
-                  {t("mobileScanner.camera", "Camera")}
+              <Stack gap={2} align="center">
+                <Text size="lg" fw={700} c="white">
+                  {t("mobileScanner.hdCamera", "HD Camera")}
                 </Text>
-                <Text size="sm" c="dimmed" ta="center">
+                <Text size="xs" c="white" opacity={0.85} ta="center">
                   {t(
-                    "mobileScanner.cameraDescription",
-                    "Scan documents using your device camera with automatic edge detection",
+                    "mobileScanner.hdCameraDescription",
+                    "Maximum quality — uses the native Android camera. No live edge detection, but corner adjustment and filters afterwards.",
                   )}
                 </Text>
               </Stack>
-            </Card>
+            </Button>
 
-            <Card
-              shadow="sm"
-              padding="xl"
-              radius="md"
-              withBorder
-              style={{ cursor: "pointer" }}
+            <Button
+              fullWidth
+              variant="subtle"
+              color="gray"
+              leftSection={<UploadRoundedIcon />}
               onClick={() => setMode("file")}
-              styles={{
-                root: {
-                  transition: "transform 0.2s, box-shadow 0.2s",
-                  "&:hover": {
-                    transform: "scale(1.02)",
-                    boxShadow: "var(--mantine-shadow-md)",
-                  },
-                },
-              }}
             >
-              <Stack align="center" gap="md">
-                <UploadRoundedIcon
-                  style={{
-                    fontSize: "3rem",
-                    color: "var(--mantine-color-green-6)",
-                  }}
-                />
-                <Text size="lg" fw={600}>
-                  {t("mobileScanner.fileUpload", "File Upload")}
-                </Text>
-                <Text size="sm" c="dimmed" ta="center">
-                  {t(
-                    "mobileScanner.fileDescription",
-                    "Upload existing photos or documents from your device",
-                  )}
-                </Text>
-              </Stack>
-            </Card>
+              {t("mobileScanner.fileUpload", "File Upload")}
+            </Button>
           </Stack>
         </Stack>
       )}
@@ -1977,16 +2212,17 @@ export default function MobileScannerPage() {
           >
             <Stack gap="sm">
               {previewBase && openCvReady && (
-                <>
-                  <Box
-                    style={{
-                      display: "flex",
-                      gap: "var(--space-sm)",
-                      overflowX: "auto",
-                      paddingBottom: "var(--space-xs)",
-                    }}
-                  >
-                    {FILTER_ORDER.map((filter) => (
+                <Box
+                  style={{
+                    display: "flex",
+                    gap: "var(--space-sm)",
+                    overflowX: "auto",
+                    paddingBottom: "var(--space-xs)",
+                  }}
+                >
+                  {FILTER_ORDER.map((filter) => {
+                    const selected = activeFilter === filter;
+                    return (
                       <Stack
                         key={filter}
                         gap={4}
@@ -2000,10 +2236,9 @@ export default function MobileScannerPage() {
                             height: "56px",
                             borderRadius: "var(--radius-sm)",
                             overflow: "hidden",
-                            border:
-                              activeFilter === filter
-                                ? "2px solid var(--mantine-color-blue-6)"
-                                : "2px solid var(--border-subtle)",
+                            border: selected
+                              ? "2px solid var(--mantine-color-green-6)"
+                              : "2px solid var(--border-subtle)",
                             background: "var(--bg-background)",
                           }}
                         >
@@ -2019,70 +2254,137 @@ export default function MobileScannerPage() {
                             />
                           )}
                         </Box>
-                        <Text size="xs">
+                        <Text
+                          size="xs"
+                          fw={selected ? 700 : 400}
+                          c={selected ? "green.6" : undefined}
+                          style={{
+                            textDecoration: selected ? "underline" : "none",
+                          }}
+                        >
                           {t(
                             `mobileScanner.filter${filter.charAt(0).toUpperCase() + filter.slice(1)}`,
                             filter,
                           )}
                         </Text>
                       </Stack>
-                    ))}
-                  </Box>
-                  <Box>
-                    <Text size="xs" c="dimmed">
-                      {t("mobileScanner.brightness", "Brightness")}
-                    </Text>
-                    <Slider
-                      value={brightness}
-                      onChange={setBrightness}
-                      min={-100}
-                      max={100}
-                      step={5}
-                      label={null}
-                    />
-                  </Box>
-                  <Box>
-                    <Text size="xs" c="dimmed">
-                      {t("mobileScanner.contrast", "Contrast")}
-                    </Text>
-                    <Slider
-                      value={contrast}
-                      onChange={setContrast}
-                      min={0.5}
-                      max={2}
-                      step={0.05}
-                      label={null}
-                    />
-                  </Box>
-                </>
+                    );
+                  })}
+                </Box>
               )}
-              {rawCapture && (
-                <Button
-                  variant="default"
+
+              {previewBase && openCvReady && (
+                <Collapse in={showAdjustments}>
+                  <Stack gap="xs" pt="xs">
+                    <Box>
+                      <Text size="xs" c="dimmed">
+                        {t("mobileScanner.brightness", "Brightness")}
+                      </Text>
+                      <Slider
+                        value={brightness}
+                        onChange={setBrightness}
+                        min={-100}
+                        max={100}
+                        step={5}
+                        label={null}
+                      />
+                    </Box>
+                    <Box>
+                      <Text size="xs" c="dimmed">
+                        {t("mobileScanner.contrast", "Contrast")}
+                      </Text>
+                      <Slider
+                        value={contrast}
+                        onChange={setContrast}
+                        min={0.5}
+                        max={2}
+                        step={0.05}
+                        label={null}
+                      />
+                    </Box>
+                    {(activeFilter === "magicColor" ||
+                      activeFilter === "colorDocument") && (
+                      <Box>
+                        <Text size="xs" c="dimmed">
+                          {t("mobileScanner.saturation", "Saturation")}
+                        </Text>
+                        <Slider
+                          value={saturation}
+                          onChange={setSaturation}
+                          min={0.5}
+                          max={2}
+                          step={0.05}
+                          label={null}
+                        />
+                      </Box>
+                    )}
+                    {activeFilter === "blackAndWhite" && (
+                      <Box>
+                        <Text size="xs" c="dimmed">
+                          {t("mobileScanner.bwStrength", "B&W cleanup")}
+                        </Text>
+                        <Slider
+                          value={bwStrength}
+                          onChange={setBwStrength}
+                          min={3}
+                          max={25}
+                          step={1}
+                          label={null}
+                        />
+                      </Box>
+                    )}
+                  </Stack>
+                </Collapse>
+              )}
+
+              <Group
+                justify="space-between"
+                align="flex-start"
+                gap={0}
+                wrap="nowrap"
+              >
+                <ActionBarButton
+                  icon={<ReplayRoundedIcon />}
+                  label={t("mobileScanner.retake", "Retake")}
+                  onClick={retake}
+                />
+                <ActionBarButton
+                  icon={<Rotate90DegreesCwRoundedIcon />}
+                  label={t("mobileScanner.rotate", "Rotate")}
+                  onClick={rotate90}
+                />
+                <ActionBarButton
+                  icon={<CropRoundedIcon />}
+                  label={t("mobileScanner.crop", "Crop")}
                   onClick={reopenAdjust}
-                  size="lg"
-                  fullWidth
-                >
-                  {t("mobileScanner.adjustCorners", "Adjust corners")}
-                </Button>
-              )}
-              <Group grow>
-                <Button variant="default" onClick={retake} size="lg">
-                  {t("mobileScanner.retake", "Retake")}
-                </Button>
-                <Button variant="filled" onClick={addToBatch} size="lg">
-                  {t("mobileScanner.addToBatch", "Add to Batch")}
-                </Button>
+                  disabled={!rawCapture}
+                />
+                <ActionBarButton
+                  icon={<TuneRoundedIcon />}
+                  label={t("mobileScanner.adjustments", "Adjust")}
+                  onClick={() => setShowAdjustments((v) => !v)}
+                  active={showAdjustments}
+                />
+                <ActionBarButton
+                  icon={<CheckRoundedIcon />}
+                  label={t("mobileScanner.confirm", "Done")}
+                  onClick={addToBatch}
+                  variant="confirm"
+                />
               </Group>
+
               <Button
                 fullWidth
-                variant="filled"
-                size="lg"
+                variant="light"
+                size="md"
                 onClick={uploadImages}
                 loading={isUploading}
+                leftSection={<UploadRoundedIcon />}
                 radius="xl"
               >
-                {t("mobileScanner.upload", "Upload")}
+                {capturedImages.length > 0
+                  ? t("mobileScanner.uploadAll", "Upload All")
+                  : t("mobileScanner.upload", "Upload")}
               </Button>
             </Stack>
           </Box>
