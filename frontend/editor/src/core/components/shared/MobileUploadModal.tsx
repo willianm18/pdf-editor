@@ -1,5 +1,15 @@
 import { useEffect, useCallback, useState, useRef } from "react";
-import { Modal, Stack, Text, Badge, Box, Alert } from "@mantine/core";
+import {
+  Modal,
+  Stack,
+  Text,
+  Badge,
+  Box,
+  Alert,
+  Card,
+  Group,
+  Button,
+} from "@mantine/core";
 import { QRCodeSVG } from "qrcode.react";
 import { useTranslation } from "react-i18next";
 import { useAppConfig } from "@app/contexts/AppConfigContext";
@@ -7,11 +17,17 @@ import InfoRoundedIcon from "@mui/icons-material/InfoRounded";
 import ErrorRoundedIcon from "@mui/icons-material/ErrorRounded";
 import CheckRoundedIcon from "@mui/icons-material/CheckRounded";
 import WarningRoundedIcon from "@mui/icons-material/WarningRounded";
+import AndroidRoundedIcon from "@mui/icons-material/AndroidRounded";
 import { Z_INDEX_OVER_FILE_MANAGER_MODAL } from "@app/styles/zIndex";
 import { BASE_PATH } from "@app/constants/app";
 import { buildMobileScannerUrl } from "@app/utils/mobileScannerUrl";
 import { convertImageToPdf, isImageFile } from "@app/utils/imageToPdfUtils";
 import apiClient from "@app/services/apiClient";
+import {
+  ANDROID_APP_AVAILABLE,
+  ANDROID_APK_URL,
+  ANDROID_APK_VERSION,
+} from "@app/constants/downloads";
 
 interface MobileUploadModalProps {
   opened: boolean;
@@ -437,6 +453,51 @@ export default function MobileUploadModal({
             {mobileUrl}
           </Text>
         </Box>
+
+        {ANDROID_APP_AVAILABLE && (
+          <Card
+            withBorder
+            radius="md"
+            padding="md"
+            style={{ background: "rgba(105, 240, 174, 0.08)" }}
+          >
+            <Stack gap="xs">
+              <Group gap="xs" wrap="nowrap">
+                <AndroidRoundedIcon style={{ color: "#2e7d32" }} />
+                <Text size="sm" fw={700}>
+                  {t(
+                    "mobileUpload.androidApp.title",
+                    "Have an Android phone? Try the native app",
+                  )}
+                </Text>
+              </Group>
+              <Text size="xs" c="dimmed">
+                {t(
+                  "mobileUpload.androidApp.description",
+                  "Native camera with live edge detection — smoother than scanning here. Not available for iPhone.",
+                )}
+              </Text>
+              <Group gap="sm" align="center" wrap="wrap">
+                <Button
+                  component="a"
+                  href={ANDROID_APK_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  size="sm"
+                  radius="md"
+                  color="green"
+                  leftSection={<AndroidRoundedIcon fontSize="small" />}
+                >
+                  {t("mobileUpload.androidApp.download", "Download for Android")}
+                </Button>
+                <Text size="xs" c="dimmed">
+                  {t("mobileUpload.androidApp.version", "version")}{" "}
+                  {ANDROID_APK_VERSION}
+                </Text>
+              </Group>
+            </Stack>
+          </Card>
+        )}
       </Stack>
     </Modal>
   );
