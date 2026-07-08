@@ -797,7 +797,7 @@ jobs:
       # instead of silently shipping a broken auto-update.
       - name: Upload binaries to Release
         if: (github.event_name == 'workflow_dispatch' && github.event.inputs.test_mode != 'true' && github.event.inputs.platform == 'all') || github.event_name == 'release' || github.ref == 'refs/heads/V2-master'
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: v${{ needs.determine-matrix.outputs.version }}
           generate_release_notes: true
